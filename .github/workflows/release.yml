@@ -37,17 +37,20 @@ jobs:
       GH_REF_NAME: ${{ github.ref_name }}
       RELEASE_VERSION_INPUT: ${{ inputs.version }}
 
+    # Every `uses:` below pins to a commit SHA, not a major-version tag.
+    # See ci.yml + issue #51 for the full rationale; trailing comment
+    # is the human-readable semver corresponding to the SHA.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
           java-version: 21
 
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6.1.0
 
       - name: Check if HEAD is already tagged
         id: tag_check

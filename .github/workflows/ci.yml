@@ -8,17 +8,25 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    # Every `uses:` below pins to a commit SHA, not a major-version tag.
+    # A tag is mutable — the action repo can repoint v6 to a different
+    # commit at any time — so a SHA pin is the only durable supply-chain
+    # control. The trailing comment carries the human-readable semver
+    # so reviewers can see at a glance which release is in play.
+    # Dependabot's github-actions ecosystem (configured in
+    # .github/dependabot.yml) keeps these SHAs current automatically.
+    # See issue #51.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
         with:
           distribution: temurin
           java-version: 21
 
-      - uses: gradle/actions/setup-gradle@v6
+      - uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6.1.0
 
       # Compile once up-front so the two test stages below don't each
       # pay for a cold classpath. Splitting test execution from
@@ -61,7 +69,7 @@ jobs:
       # failure is dense.
       - name: Upload test reports
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-reports
           path: |
