@@ -107,6 +107,66 @@ class NamingConventionStrategyTest {
     }
 
     @Test
+    void crossPackageSimpleNameCollisionStillSelectsButRecordsHint() throws IOException {
+        // Regression for #40. Two production classes with the same
+        // simple name `Foo` live in different packages —
+        // `a.b.Foo` (the one in the diff) and `c.d.Foo`. The test
+        // for `c.d.Foo` lives at `e.f.FooTest`, deliberately in a
+        // third package (mirrors the parallel-test-tree shape we
+        // can't strict-match against without breaking adopters).
+        //
+        // The naming strategy's policy is "select on simple-name
+        // match, packages don't gate," so `e.f.FooTest` IS pulled
+        // into the selection — that's documented over-selection.
+        // What we care about here is the diagnostic: the strategy
+        // must record this match in {@link #crossPackageMatches}
+        // so the engine can surface it via --explain. Otherwise
+        // an operator never sees "you ran 200 unrelated tests
+        // because of a simple-name collision" and the cost of
+        // the policy stays invisible.
+        Path testDir = tempDir.resolve("src/test/java/e/f");
+        Files.createDirectories(testDir);
+        Files.writeString(testDir.resolve("FooTest.java"),
+                "package e.f;\npublic class FooTest {}");
+
+        Set<String> result = strategy.discoverTests(Set.of("a.b.Foo"), tempDir);
+
+        assertTrue(result.contains("e.f.FooTest"),
+                "Cross-package match must still be selected — "
+                        + "over-select is the documented trade-off, "
+                        + "stricter matching breaks parallel-test-tree adopters.");
+
+        assertEquals(Set.of("e.f.FooTest"),
+                strategy.crossPackageMatches().get("a.b.Foo"),
+                "Cross-package match must be recorded so --explain "
+                        + "can surface the over-selection without "
+                        + "flipping the selection policy.");
+    }
+
+    @Test
+    void samePackageMatchIsNotRecordedAsCrossPackage() throws IOException {
+        // Companion to crossPackageSimpleNameCollisionStillSelectsButRecordsHint:
+        // the silent-success path stays silent. A test in the same
+        // package as the SUT — the most common shape — must NOT
+        // trigger the diagnostic, otherwise --explain would fire
+        // the cross-package hint on every healthy run and operators
+        // would learn to ignore it.
+        Path testDir = tempDir.resolve("src/test/java/com/example/service");
+        Files.createDirectories(testDir);
+        Files.writeString(testDir.resolve("FooBarTest.java"),
+                "package com.example.service;\npublic class FooBarTest {}");
+
+        Set<String> result = strategy.discoverTests(
+                Set.of("com.example.service.FooBar"), tempDir);
+
+        assertTrue(result.contains("com.example.service.FooBarTest"));
+        assertTrue(strategy.crossPackageMatches().isEmpty(),
+                "Same-package match must not pollute the cross-package "
+                        + "diagnostic — otherwise the hint fires on "
+                        + "every healthy run and signal value drops.");
+    }
+
+    @Test
     void findsTestsAcrossMultipleNestedModules() throws IOException {
         // Root level
         Path rootTestDir = tempDir.resolve("src/test/java/com/example");

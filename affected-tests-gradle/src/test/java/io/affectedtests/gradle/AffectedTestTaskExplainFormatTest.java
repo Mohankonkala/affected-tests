@@ -1109,6 +1109,116 @@ class AffectedTestTaskExplainFormatTest {
     }
 
     @Test
+    void crossPackageNamingHintListsThePairsOnDiscoverySuccess() {
+        // Regression for #40: when NamingConventionStrategy adds a
+        // test whose package differs from the changed production
+        // class, --explain must surface that as a Hint with the
+        // exact pair listed. Without this an operator never sees
+        // "you ran 200 unrelated tests because of a simple-name
+        // collision", and the cost of the package-agnostic naming
+        // policy stays invisible.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of("e.f.FooTest"), Map.of(),
+                Set.of("src/main/java/a/b/Foo.java"),
+                Set.of("a.b.Foo"), Set.of(),
+                new Buckets(Set.of(), Set.of(),
+                        Set.of("src/main/java/a/b/Foo.java"),
+                        Set.of(), Set.of()),
+                false, false,
+                Situation.DISCOVERY_SUCCESS, Action.SELECTED,
+                EscalationReason.NONE,
+                Map.of("a.b.Foo", Set.of("e.f.FooTest")));
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("naming strategy selected 1 test"),
+                "Hint must headline with the count so operators "
+                        + "can immediately judge severity. Got:\n" + trace);
+        assertTrue(trace.contains("a.b.Foo → e.f.FooTest"),
+                "Hint must list the exact (changed → test) pair — "
+                        + "without the FQNs the operator can't tell "
+                        + "whether the over-select is a real bug or "
+                        + "a deliberate parallel-test-tree choice. "
+                        + "Got:\n" + trace);
+        assertTrue(trace.contains("over-select is the documented trade-off"),
+                "Hint must explain that the test is still selected and "
+                        + "WHY, otherwise it reads as 'something went "
+                        + "wrong'. Got:\n" + trace);
+    }
+
+    @Test
+    void crossPackageNamingHintIsSilentWhenNoCrossPackageMatches() {
+        // Companion: the silent-success path stays silent. A
+        // healthy DISCOVERY_SUCCESS run with no cross-package
+        // matches must not fire the hint. Otherwise --explain
+        // trains operators to ignore the hint on every run.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of("com.example.FooTest"), Map.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of("com.example.Foo"), Set.of(),
+                new Buckets(Set.of(), Set.of(),
+                        Set.of("src/main/java/com/example/Foo.java"),
+                        Set.of(), Set.of()),
+                false, false,
+                Situation.DISCOVERY_SUCCESS, Action.SELECTED,
+                EscalationReason.NONE,
+                Map.of());
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertFalse(trace.contains("naming strategy selected"),
+                "Healthy run with no cross-package matches must not "
+                        + "fire the hint. Got:\n" + trace);
+        assertFalse(trace.contains("possible cross-package simple-name collision"),
+                "The silent-success path must stay silent. Got:\n" + trace);
+    }
+
+    @Test
+    void crossPackageNamingHintTruncatesOver10PairsWithRemainderCount() {
+        // Same EXPLAIN_SAMPLE_LIMIT contract the bucket samples
+        // honour. A monorepo can produce hundreds of cross-package
+        // matches; dumping all of them buries the signal. Cap at
+        // 10 with a "+N more" tail so the operator gets the shape
+        // and can opt into --info for the full list.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        java.util.LinkedHashMap<String, Set<String>> matches = new java.util.LinkedHashMap<>();
+        matches.put("a.b.Foo", new java.util.LinkedHashSet<>(java.util.List.of(
+                "p0.FooTest", "p1.FooTest", "p2.FooTest", "p3.FooTest",
+                "p4.FooTest", "p5.FooTest", "p6.FooTest", "p7.FooTest",
+                "p8.FooTest", "p9.FooTest", "p10.FooTest", "p11.FooTest")));
+
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of(), Map.of(),
+                Set.of("src/main/java/a/b/Foo.java"),
+                Set.of("a.b.Foo"), Set.of(),
+                new Buckets(Set.of(), Set.of(),
+                        Set.of("src/main/java/a/b/Foo.java"),
+                        Set.of(), Set.of()),
+                false, false,
+                Situation.DISCOVERY_SUCCESS, Action.SELECTED,
+                EscalationReason.NONE,
+                matches);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("naming strategy selected 12 tests"),
+                "Header must report the total count, not just the "
+                        + "rendered subset. Got:\n" + trace);
+        assertTrue(trace.contains("p0.FooTest"),
+                "First pair must render. Got:\n" + trace);
+        assertTrue(trace.contains("p9.FooTest"),
+                "Tenth (last under cap) pair must render. Got:\n" + trace);
+        assertFalse(trace.contains("p10.FooTest"),
+                "Pairs past the cap must not render or the trace gets "
+                        + "buried in scrollback. Got:\n" + trace);
+        assertTrue(trace.contains("(+2 more"),
+                "Truncation must surface the remainder count so the "
+                        + "operator knows to opt into --info. Got:\n" + trace);
+    }
+
+    @Test
     void riskCWarnMessageUsesSingularForExactlyOneFqn() {
         // Plurality drift between "1 test class" and "1 test classes"
         // is the sort of micro-bug that makes the message read like
