@@ -3,11 +3,6 @@ package io.affectedtests.core.discovery;
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.ImportDeclaration;
-import com.github.javaparser.ast.body.FieldDeclaration;
-import com.github.javaparser.ast.body.MethodDeclaration;
-import com.github.javaparser.ast.body.Parameter;
-import com.github.javaparser.ast.body.VariableDeclarator;
-import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import io.affectedtests.core.config.AffectedTestsConfig;
 import io.affectedtests.core.util.LogSanitizer;
@@ -16,29 +11,40 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.util.*;
-import java.util.regex.Pattern;
 
 /**
  * Strategy: Usage / Reference scanning.
  *
- * <p>Scans test source files for references to changed production classes.
- * Uses a two-tier approach:
+ * <p>For each test source file, decides whether it transitively depends on
+ * any of the changed production classes. The decision flows through four
+ * tiers, each cheaper than the next would be:
  * <ol>
- *   <li><strong>Import matching (primary):</strong> if a test file directly imports the
- *       changed class FQN, it is considered affected.</li>
- *   <li><strong>Type reference scanning (secondary):</strong> for same-package and wildcard
- *       import cases, scans for the simple name in field declarations, method parameters,
- *       constructor instantiations, and type references.</li>
+ *   <li><strong>Tier&nbsp;1 — direct import.</strong> Scans the test file's
+ *       import list. Cheapest tier; no AST walk. Hits the common case
+ *       (test imports the changed class explicitly).</li>
+ *   <li><strong>Tier&nbsp;1b — wildcard import.</strong> Two flavours:
+ *       <code>import pkg.Foo.*;</code> (class-member wildcard, treated as a
+ *       direct dependency on {@code pkg.Foo} regardless of body refs) and
+ *       <code>import pkg.*;</code> (package wildcard, gated on the simple
+ *       name actually appearing in the body so it does not over-select).</li>
+ *   <li><strong>Tier&nbsp;2 — same package.</strong> No import is needed
+ *       when test and changed class share a package; gates on the simple
+ *       name appearing in the body.</li>
+ *   <li><strong>Tier&nbsp;3 — fully-qualified inline reference.</strong>
+ *       Catches code that types {@code com.example.Foo} inline without
+ *       importing it (cucumber steps, generated code, etc.).</li>
  * </ol>
+ *
+ * <p>Tiers&nbsp;1b/2/3 all need to know which simple names and which dotted
+ * scoped names appear as type references anywhere in the AST. Both sets are
+ * built lazily in a single pass over {@code ClassOrInterfaceType} nodes and
+ * shared across the three tiers — see {@link UsageStrategy.AstReferences}.
  */
 public final class UsageStrategy implements TestDiscoveryStrategy {
 
     private static final Logger log = LoggerFactory.getLogger(UsageStrategy.class);
 
     private final AffectedTestsConfig config;
-    // Patterns are derived from simple class names; cache avoids recompiling on
-    // every AST-walk iteration (hot path called per file × per changed class).
-    private final Map<String, Pattern> patternCache = new HashMap<>();
 
     public UsageStrategy(AffectedTestsConfig config) {
         this.config = config;
@@ -111,7 +117,31 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
 
     /**
      * Checks whether a test compilation unit references any of the changed classes.
-     * Uses a two-tier approach: direct import match first, then type reference scanning.
+     * Tiered, with the cheapest tier first:
+     *
+     * <ol>
+     *   <li><strong>Tier 1 — direct import match</strong>: pure scan of the
+     *       compilation unit's import list. No AST walk, no allocation per
+     *       changed class.</li>
+     *   <li><strong>Tier 1b/2/3</strong>: any of these need to know which
+     *       simple names and which dotted scoped names appear as type
+     *       references anywhere in the AST. Both sets are built lazily in a
+     *       single {@link CompilationUnit#findAll(Class)} walk over
+     *       {@link ClassOrInterfaceType} — {@link AstReferences#of(CompilationUnit)}.
+     *       Pre-this-refactor the same information was rebuilt by up to
+     *       five separate AST walks per file (four inside the now-removed
+     *       {@code typeNameAppearsInAst} helper, plus one explicit walk in
+     *       Tier&nbsp;3); on a typical service that's a 3–5× cost on the
+     *       hot path.</li>
+     * </ol>
+     *
+     * <p>All {@code changedFqn} and {@code imported} values flowing into the
+     * log statements below are diff-derived and may legitimately carry odd
+     * but-valid characters that still need control-char sanitisation before
+     * they hit the logger — a malicious MR can craft an import line like
+     * {@code import com.evil.\u001b[m;}. Sanitisation is applied even at
+     * DEBUG because operators bumping level to chase a false-positive
+     * selection is exactly when forgery-resistance matters most.
      */
     private boolean testReferencesChangedClass(CompilationUnit cu,
                                                Set<String> changedFqns,
@@ -127,11 +157,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
                 // `a.b.C.MAX` and for `import static a.b.C.*;` is `a.b.C`
                 // (with isAsterisk=true). The thing a test actually depends
                 // on in both cases is the class `a.b.C`, so we normalise
-                // back to the class FQN for direct-import matching. Before
-                // this, a test that only referenced a changed class through
-                // a `import static … .CONSTANT;` was silently missed
-                // because the name in importedFqns had a member suffix that
-                // never equalled any changedFqn.
+                // back to the class FQN for direct-import matching.
                 String classFqn = imp.isAsterisk()
                         ? name
                         : stripLastSegment(name);
@@ -145,21 +171,12 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             }
         }
 
-        // Tier 1: Direct import match. `innerClassMatch` also fires when
-        // an import targets a nested class of the changed outer — e.g.
-        // the test writes `import c.d.Outer.Inner;` and the diff touches
-        // `c.d.Outer` (PathToClassMapper is file-based, so it only
-        // surfaces the outer FQN for the nested class's change). Without
-        // this, a test that only uses the inner class is silently missed.
-        // All {@code changedFqn} and {@code imported} values in the
-        // Tier 1 / 1b / 2 / 3 blocks below are diff-derived and may
-        // legitimately carry odd but-valid characters that still need
-        // control-char sanitisation before they hit the logger — a
-        // malicious MR can craft an import line like
-        // {@code import com.evil.\u001b[m;}. Sanitisation is applied
-        // even at DEBUG because operators bumping level to chase a
-        // false-positive selection is exactly when forgery-resistance
-        // matters most.
+        // Tier 1: Direct import match. `innerClassMatch` also fires when an
+        // import targets a nested class of the changed outer — e.g. the test
+        // writes `import c.d.Outer.Inner;` and the diff touches `c.d.Outer`
+        // (PathToClassMapper is file-based, so it only surfaces the outer FQN
+        // for the nested class's change). Pre-this-tier, a test that only
+        // uses the inner class was silently missed.
         for (String changedFqn : changedFqns) {
             if (importedFqns.contains(changedFqn)) {
                 log.debug("  Direct import match: {}", LogSanitizer.sanitize(changedFqn));
@@ -176,25 +193,25 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             }
         }
 
+        // Single AST walk shared by Tier 1b, Tier 2, and Tier 3. Built lazily
+        // so a file that resolves on Tier 1 (the common case for tests with
+        // explicit imports) never pays for the walk.
+        AstReferences refs = AstReferences.of(cu);
+
         // Tier 1b: Wildcard import match. Two shapes have to be handled:
         //
         //   * `import com.example.service.*;`      — a package wildcard;
-        //     the test may reference any simple type inside that
-        //     package. We gate on the simple name actually appearing in
-        //     the AST so we don't over-select.
+        //     the test may reference any simple type inside that package.
+        //     We gate on the simple name actually appearing in the AST so
+        //     we don't over-select.
         //
         //   * `import com.example.Outer.*;`        — a class-member
         //     wildcard. Every member of `Outer` (including its nested
         //     types and public static members) is visible in the test
-        //     without further qualification, so a change to
-        //     `Outer.java` — which PathToClassMapper reports as a
-        //     change to `com.example.Outer` — must pull the test in
-        //     unconditionally; the test doesn't have to mention
-        //     `Outer` by name at all. Pre-fix this case was bucketed
-        //     as a package wildcard (`wildcardPackages` held
-        //     "com.example.Outer") and the subsequent
-        //     `typeNameAppearsInAst("Outer")` check almost always
-        //     failed, silently dropping the consumer's coverage.
+        //     without further qualification, so a change to `Outer.java`
+        //     — which PathToClassMapper reports as a change to
+        //     `com.example.Outer` — must pull the test in unconditionally;
+        //     the test doesn't have to mention `Outer` by name at all.
         for (String changedFqn : changedFqns) {
             if (wildcardPackages.contains(changedFqn)) {
                 log.debug("  Wildcard class-member import match: {}",
@@ -204,7 +221,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             String pkg = SourceFileScanner.packageOf(changedFqn);
             if (wildcardPackages.contains(pkg)) {
                 String simpleName = SourceFileScanner.simpleClassName(changedFqn);
-                if (typeNameAppearsInAst(cu, simpleName)) {
+                if (refs.simpleNames.contains(simpleName)) {
                     log.debug("  Wildcard package import + type ref match: {}",
                             LogSanitizer.sanitize(changedFqn));
                     return true;
@@ -212,7 +229,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             }
         }
 
-        // Tier 2: Same-package (no import needed)
+        // Tier 2: Same-package (no import needed).
         String testPackage = cu.getPackageDeclaration()
                 .map(pd -> pd.getNameAsString())
                 .orElse("");
@@ -220,7 +237,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             String changedPkg = SourceFileScanner.packageOf(changedFqn);
             if (testPackage.equals(changedPkg)) {
                 String simpleName = SourceFileScanner.simpleClassName(changedFqn);
-                if (typeNameAppearsInAst(cu, simpleName)) {
+                if (refs.simpleNames.contains(simpleName)) {
                     log.debug("  Same-package type ref match: {}",
                             LogSanitizer.sanitize(changedFqn));
                     return true;
@@ -228,22 +245,16 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             }
         }
 
-        // Tier 3: Fully-qualified inline references that never went
-        // through an import. Catches
+        // Tier 3: Fully-qualified inline references that never went through
+        // an import. Catches
         //   `com.example.other.Thing t = new com.example.other.Thing();`
         //   `(com.example.other.Thing) x`
         //   `com.example.other.Thing.Inner nested = ...;`
-        // i.e. anything where the test author typed the full dotted
-        // name of the changed class at a use site. Walks every
-        // {@link ClassOrInterfaceType} node and reads its
-        // {@code getNameWithScope()} (which reconstitutes the dotted
-        // chain from the parent scope references), so we don't depend
-        // on raw source text or comments. The bare-name case is
-        // already handled by Tier 1 / 1b / 2; skip dotless hits here
+        // anywhere the test author typed the full dotted name of the changed
+        // class at a use site. The bare-name case is already handled by
+        // Tier 1 / 1b / 2; the dotted set is filtered to dotted entries only
         // to avoid double-counting.
-        for (ClassOrInterfaceType type : cu.findAll(ClassOrInterfaceType.class)) {
-            String scoped = nameWithScopeOrNull(type);
-            if (scoped == null || !scoped.contains(".")) continue;
+        for (String scoped : refs.dottedNames) {
             for (String changedFqn : changedFqns) {
                 if (scoped.equals(changedFqn) || scoped.startsWith(changedFqn + ".")) {
                     log.debug("  Inline fully-qualified reference: {} -> {}",
@@ -255,6 +266,53 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         }
 
         return false;
+    }
+
+    /**
+     * Snapshot of every type reference in a compilation unit, in the two
+     * shapes the tiered matcher needs:
+     *
+     * <ul>
+     *   <li>{@link #simpleNames} — the unqualified leaf name of every
+     *       {@link ClassOrInterfaceType} node (e.g. both {@code List} and
+     *       {@code Foo} for source {@code List<Foo>}, both {@code Outer}
+     *       and {@code Inner} for source {@code Outer.Inner}). Used by
+     *       Tier&nbsp;1b and Tier&nbsp;2 for membership checks against
+     *       changed-class simple names.</li>
+     *   <li>{@link #dottedNames} — the {@code getNameWithScope()} string of
+     *       every type node whose result is a dotted form (i.e. has at
+     *       least one {@code .}). Used by Tier&nbsp;3 to match
+     *       fully-qualified inline references.</li>
+     * </ul>
+     *
+     * <p>Both sets are built in a single {@code findAll(ClassOrInterfaceType.class)}
+     * walk. Walking once and indexing replaces the previous shape, where
+     * the same information was implicitly rebuilt by repeated AST walks
+     * (one per changed-class match attempt × per file). The hot path
+     * — {@code testReferencesChangedClass} called per test file × per
+     * changed class — drops from O(walk × matches) to O(walk + matches).
+     */
+    private static final class AstReferences {
+        final Set<String> simpleNames;
+        final Set<String> dottedNames;
+
+        private AstReferences(Set<String> simpleNames, Set<String> dottedNames) {
+            this.simpleNames = simpleNames;
+            this.dottedNames = dottedNames;
+        }
+
+        static AstReferences of(CompilationUnit cu) {
+            Set<String> simpleNames = new HashSet<>();
+            Set<String> dottedNames = new HashSet<>();
+            for (ClassOrInterfaceType type : cu.findAll(ClassOrInterfaceType.class)) {
+                simpleNames.add(type.getNameAsString());
+                String scoped = nameWithScopeOrNull(type);
+                if (scoped != null && scoped.indexOf('.') >= 0) {
+                    dottedNames.add(scoped);
+                }
+            }
+            return new AstReferences(simpleNames, dottedNames);
+        }
     }
 
     /**
@@ -275,34 +333,6 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
     }
 
     /**
-     * Checks whether the given simple type name appears in the AST as a type reference.
-     */
-    private boolean typeNameAppearsInAst(CompilationUnit cu, String simpleName) {
-        for (FieldDeclaration field : cu.findAll(FieldDeclaration.class)) {
-            for (VariableDeclarator var : field.getVariables()) {
-                if (typeMatches(var.getTypeAsString(), simpleName)) return true;
-            }
-        }
-
-        for (MethodDeclaration method : cu.findAll(MethodDeclaration.class)) {
-            for (Parameter param : method.getParameters()) {
-                if (typeMatches(param.getTypeAsString(), simpleName)) return true;
-            }
-            if (typeMatches(method.getTypeAsString(), simpleName)) return true;
-        }
-
-        for (ObjectCreationExpr expr : cu.findAll(ObjectCreationExpr.class)) {
-            if (typeMatches(expr.getTypeAsString(), simpleName)) return true;
-        }
-
-        for (ClassOrInterfaceType type : cu.findAll(ClassOrInterfaceType.class)) {
-            if (type.getNameAsString().equals(simpleName)) return true;
-        }
-
-        return false;
-    }
-
-    /**
      * Returns {@code name} with the final {@code .segment} removed. For
      * {@code "a.b.C.MAX"} returns {@code "a.b.C"}; for a single-segment
      * input returns {@code null} (the input is already as stripped as it
@@ -314,17 +344,6 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             return null;
         }
         return name.substring(0, idx);
-    }
-
-    /**
-     * Matches a type string against a simple name, handling generics.
-     * Uses word-boundary matching to avoid false positives (e.g. "Id" matching "GridLayout").
-     */
-    private boolean typeMatches(String typeString, String simpleName) {
-        if (typeString.equals(simpleName)) return true;
-        Pattern pattern = patternCache.computeIfAbsent(simpleName,
-                n -> Pattern.compile("(?<![a-zA-Z0-9_])" + Pattern.quote(n) + "(?![a-zA-Z0-9_])"));
-        return pattern.matcher(typeString).find();
     }
 
     private String extractFqn(CompilationUnit cu, Path testFile) {
