@@ -320,10 +320,17 @@ affectedTests {
     // Test class suffixes (default: ["Test", "IT", "ITTest", "IntegrationTest"])
     testSuffixes = ["Test", "IT", "ITTest", "IntegrationTest"]
 
-    // Source directories (default: ["src/main/java"])
+    // Source directories (default: auto-discovered from JavaPluginExtension
+    // source sets at projectsEvaluated time, falling back to ["src/main/java"]
+    // when no Java plugin is applied; setting an explicit list here always
+    // wins, since Gradle's Property.convention semantics apply only when no
+    // value is set)
     sourceDirs = ["src/main/java"]
 
-    // Test directories (default: ["src/test/java"])
+    // Test directories (default: auto-discovered from JavaPluginExtension —
+    // any source set wired to a Test-typed task surfaces here, including
+    // custom names like `integrationTest`, `e2eTest`, etc.; setting an
+    // explicit list overrides the auto-discovered default)
     testDirs = ["src/test/java"]
 
     // Gradle test task names the dispatch path may invoke (default: ["test"]).
@@ -370,6 +377,14 @@ All four strategies run against every changed production class. Their results ar
 The plugin scans the project tree **recursively at any depth** to find source and test directories. It is completely project-structure agnostic — it does not assume any particular module layout. Whether your modules are flat (`api/src/test/java`), nested (`services/orders/src/test/java`), or deeply nested (`platform/services/orders/src/test/java`), all test files are discovered.
 
 Directories like `.git`, `build`, `.gradle`, and `node_modules` are automatically skipped during the walk. `outOfScopeTestDirs` and `outOfScopeSourceDirs` are additionally filtered at index time so discovery never picks up tests living there.
+
+### Source-set auto-discovery
+
+When the consumer applies the Java plugin (or anything that derives from `java-base`), the plugin walks each subproject's `JavaPluginExtension` source sets at `gradle.projectsEvaluated` time and seeds `sourceDirs` / `testDirs` from the live source-set graph. A source set is classified as a **test source set** when a `Test`-typed Gradle task points at its `output.classesDirs` — the same convention `JvmTestSuitePlugin` uses. Everything else falls into `sourceDirs` (the production bucket), including helper / fixture source sets that are consumed by tests at compile time but have no Test task of their own.
+
+The result: an adopter with `src/integrationTest/java` + a same-named `integrationTest` Gradle task picks up that directory automatically — no `affectedTests { testDirs = […] }` line required. Custom layouts (e.g. a `main` source set rooted at `src/cool/java`) are also picked up verbatim, since the suffix is computed by relativising every `srcDir` against its owning project.
+
+If the auto-discovered list isn't what you want — for example, on a non-conventional monorepo where one module's `internal-test` source set should not influence selection — set `sourceDirs` / `testDirs` explicitly in the DSL. Gradle's Property semantics put an explicit `set()` ahead of any `convention()`, so the auto-discovered default never overrides a pinned value.
 
 ### Directly changed tests
 

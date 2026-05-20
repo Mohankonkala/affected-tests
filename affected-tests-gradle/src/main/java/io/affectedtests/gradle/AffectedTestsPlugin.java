@@ -160,6 +160,69 @@ public class AffectedTestsPlugin implements Plugin<Project> {
                                 + "(0 disables the timeout); got " + timeout);
             }
         });
+
+        // Source-set auto-discovery (issue #49): when the consumer hasn't
+        // explicitly set sourceDirs / testDirs / testTaskNames in
+        // build.gradle, we walk every subproject's {@link JavaPluginExtension}
+        // source sets and seed the conventions from the discovered layout.
+        //
+        // Hooked via {@code gradle.projectsEvaluated} rather than the root's
+        // own {@code afterEvaluate} so every subproject's
+        // {@code apply java} block (including those triggered by Spring
+        // Boot / convention plugins inside their own
+        // {@code afterEvaluate} listeners) has had a chance to declare
+        // its source sets and Test tasks. Doing this in root-only
+        // afterEvaluate would silently drop subprojects' source sets in
+        // the common multi-module shape — exactly the regression #49
+        // is raised to prevent.
+        //
+        // The replacement is routed through {@code Property.convention(value)}
+        // so an explicit {@code extension.testDirs = [...]} in
+        // build.gradle still wins. Gradle's convention semantics
+        // ("default if no explicit value set") deliver that
+        // out-of-the-box without an extra is-set check on our side.
+        project.getGradle().projectsEvaluated(g ->
+                seedAutoDiscoveredConventions(rootProject, extension));
+    }
+
+    /**
+     * Replaces the static {@code "src/main/java"} / {@code "src/test/java"}
+     * / {@code "test"} conventions with auto-discovered values when the
+     * consumer hasn't explicitly set the property. The replacement is
+     * routed through {@code Property.convention(value)} so an explicit
+     * {@code extension.testDirs = [...]} in build.gradle still wins —
+     * Gradle's convention semantics already say "convention is the
+     * default if no value is set".
+     *
+     * <p>We deliberately use a single static {@code List<String>} rather
+     * than a lazy {@code Provider} because:
+     * <ul>
+     *   <li>The walk runs at {@code afterEvaluate} time, which is also
+     *       when the discovery happens — there's no benefit to deferring
+     *       it to the task-execution thread.</li>
+     *   <li>Configuration cache safety is simpler with a static list:
+     *       no captured {@code Project} reference, no provider chain to
+     *       serialise.</li>
+     *   <li>The overhead is paid exactly once per build, not once per
+     *       task that wires through {@code task.testDirs.set(extension.testDirs)}.</li>
+     * </ul>
+     */
+    private static void seedAutoDiscoveredConventions(Project rootProject,
+                                                      AffectedTestsExtension extension) {
+        SourceSetAutoDiscovery discovery = SourceSetAutoDiscovery.from(rootProject);
+        if (discovery.hasMainDirs()) {
+            extension.getSourceDirs().convention(discovery.sourceDirs());
+        }
+        if (discovery.hasTestDirs()) {
+            extension.getTestDirs().convention(discovery.testDirs());
+        }
+        if (discovery.hasTestTaskNames()) {
+            // Feeds the #48 dispatch path: discovered Test-task names
+            // (e.g. ["test", "integrationTest"]) become the default for
+            // per-task routing. Explicit testTaskNames in the DSL still
+            // win because convention() only fills the unset case.
+            extension.getTestTaskNames().convention(discovery.testTaskNames());
+        }
     }
 
     /**

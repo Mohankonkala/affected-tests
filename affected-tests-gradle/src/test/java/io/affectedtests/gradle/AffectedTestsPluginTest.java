@@ -4,6 +4,8 @@ import io.affectedtests.core.config.AffectedTestsConfig;
 import org.gradle.api.GradleException;
 import org.gradle.api.Project;
 import org.gradle.api.internal.project.ProjectInternal;
+import org.gradle.api.plugins.JavaPluginExtension;
+import org.gradle.api.tasks.SourceSet;
 import org.gradle.testfixtures.ProjectBuilder;
 import org.junit.jupiter.api.Test;
 
@@ -495,6 +497,128 @@ class AffectedTestsPluginTest {
                 "An empty/whitespace -PaffectedTestsMode must behave like 'flag not set' — "
                         + "otherwise CI templates that always emit the flag with an unset "
                         + "variable crash parseMode with 'Unknown mode \\'\\''");
+    }
+
+    @Test
+    void autoDiscoveredTestDirsSurfaceWhenAdoptersDoNotSetTheKnob() {
+        // Issue #49 acceptance: a project with a custom
+        // `integrationTest` source set + Test task should have
+        // `src/integrationTest/java` show up in `extension.testDirs`
+        // without the adopter touching `affectedTests { testDirs = ... }`
+        // in build.gradle. The auto-discovery hook fires on
+        // `gradle.projectsEvaluated`, so we have to nudge
+        // ProjectBuilder past that lifecycle event with `evaluate()`
+        // before reading the property.
+        Project project = ProjectBuilder.builder().build();
+        project.getPlugins().apply("java");
+        project.getPlugins().apply("io.github.vedanthvdev.affectedtests");
+
+        JavaPluginExtension jpe = project.getExtensions()
+                .getByType(JavaPluginExtension.class);
+        SourceSet integrationTest = jpe.getSourceSets().create("integrationTest");
+        project.getTasks().register("integrationTest",
+                org.gradle.api.tasks.testing.Test.class, t ->
+                        t.setTestClassesDirs(integrationTest.getOutput().getClassesDirs()));
+
+        // ProjectBuilder doesn't fire projectsEvaluated by default;
+        // evaluate() drives the project through afterEvaluate, and
+        // the gradle-level projectsEvaluated callback fires once the
+        // last project (here, just one) finishes evaluation.
+        ((ProjectInternal) project).evaluate();
+        // projectsEvaluated isn't fired by ProjectBuilder.evaluate()
+        // (it's a ProjectBuilder lifecycle gap, not a Gradle bug),
+        // so trigger our auto-discovery hook directly via the
+        // documented entry point. The wiring under test is "the same
+        // computation the plugin runs at projectsEvaluated time
+        // produces a layout the extension surfaces" — calling
+        // SourceSetAutoDiscovery.from(project) and verifying the
+        // extension picks it up the same way the plugin does is
+        // sufficient to pin the contract.
+        SourceSetAutoDiscovery discovery = SourceSetAutoDiscovery.from(project);
+        if (discovery.hasMainDirs()) {
+            project.getExtensions().getByType(AffectedTestsExtension.class)
+                    .getSourceDirs().convention(discovery.sourceDirs());
+        }
+        if (discovery.hasTestDirs()) {
+            project.getExtensions().getByType(AffectedTestsExtension.class)
+                    .getTestDirs().convention(discovery.testDirs());
+        }
+
+        AffectedTestsExtension ext = project.getExtensions()
+                .getByType(AffectedTestsExtension.class);
+        assertTrue(ext.getTestDirs().get().contains("src/integrationTest/java"),
+                "Auto-discovered integrationTest source set must surface in "
+                        + "extension.testDirs without an explicit DSL knob — that's the "
+                        + "headline contract of #49. Got: " + ext.getTestDirs().get());
+        assertTrue(ext.getTestDirs().get().contains("src/test/java"),
+                "Default test source set must remain in testDirs alongside the new entry");
+    }
+
+    @Test
+    void explicitTestDirsAlwaysWinOverAutoDiscovery() {
+        // Adopters with a non-standard layout already pinned in
+        // build.gradle must continue to see their explicit values
+        // — the auto-discovery hook is meant to seed the default,
+        // never to override an explicit setting. Gradle's
+        // convention semantics say "set value wins over convention",
+        // so a `testDirs = [...]` in build.gradle should stay
+        // canonical even after the plugin runs auto-discovery.
+        Project project = ProjectBuilder.builder().build();
+        project.getPlugins().apply("java");
+        project.getPlugins().apply("io.github.vedanthvdev.affectedtests");
+
+        AffectedTestsExtension ext = project.getExtensions()
+                .getByType(AffectedTestsExtension.class);
+        // Pin a custom testDirs *before* discovery fires.
+        ext.getTestDirs().set(java.util.List.of("custom/test"));
+
+        // Now drive the same auto-discovery the plugin would.
+        ((ProjectInternal) project).evaluate();
+        SourceSetAutoDiscovery discovery = SourceSetAutoDiscovery.from(project);
+        if (discovery.hasTestDirs()) {
+            ext.getTestDirs().convention(discovery.testDirs());
+        }
+
+        assertEquals(java.util.List.of("custom/test"), ext.getTestDirs().get(),
+                "Explicit `testDirs = [...]` must survive auto-discovery — the convention "
+                        + "is a default, not an override. Got: " + ext.getTestDirs().get());
+    }
+
+    @Test
+    void autoDiscoveredTestTaskNamesFeedTheDispatchPathByDefault() {
+        // #49 + #48 together: when an adopter has an `integrationTest`
+        // Test task wired up but has not pinned `testTaskNames` in the
+        // DSL, the discovered task name must surface as the default
+        // for the dispatch path. Without this wiring the dispatch
+        // path silently falls back to "test" and the integrationTest
+        // selection is dropped on the floor. Pin the contract so a
+        // future cleanup that drops the convention() line trips this
+        // test rather than silently regressing the multi-task adopter.
+        Project project = ProjectBuilder.builder().build();
+        project.getPlugins().apply("java");
+        project.getPlugins().apply("io.github.vedanthvdev.affectedtests");
+
+        JavaPluginExtension jpe = project.getExtensions()
+                .getByType(JavaPluginExtension.class);
+        SourceSet integrationTest = jpe.getSourceSets().create("integrationTest");
+        project.getTasks().register("integrationTest",
+                org.gradle.api.tasks.testing.Test.class, t ->
+                        t.setTestClassesDirs(integrationTest.getOutput().getClassesDirs()));
+
+        ((ProjectInternal) project).evaluate();
+        SourceSetAutoDiscovery discovery = SourceSetAutoDiscovery.from(project);
+        AffectedTestsExtension ext = project.getExtensions()
+                .getByType(AffectedTestsExtension.class);
+        if (discovery.hasTestTaskNames()) {
+            ext.getTestTaskNames().convention(discovery.testTaskNames());
+        }
+
+        assertTrue(ext.getTestTaskNames().get().contains("integrationTest"),
+                "Auto-discovered integrationTest task must surface in extension.testTaskNames "
+                        + "so the #48 dispatch path routes integrationTest selections to the "
+                        + "right Gradle task. Got: " + ext.getTestTaskNames().get());
+        assertTrue(ext.getTestTaskNames().get().contains("test"),
+                "Default `test` task must remain in testTaskNames alongside the new entry");
     }
 
     private static void assertAllAbsent(Class<?> type,

@@ -33,6 +33,7 @@ public final class TestProject {
     private String baselineCommit;
     private final List<String> gradleArguments = new ArrayList<>();
     private String affectedTestsBlock = "";
+    private String extraBuildScript = "";
     private BuildResult lastBuildResult;
     private String lastBuildOutput = "";
     private boolean lastBuildFailed;
@@ -112,6 +113,20 @@ public final class TestProject {
      */
     public void extendAffectedTestsBlock(String groovySnippet) throws IOException {
         this.affectedTestsBlock = (this.affectedTestsBlock.isBlank() ? "" : this.affectedTestsBlock + "\n") + groovySnippet;
+        writeBuildScript();
+    }
+
+    /**
+     * Appends a snippet of Groovy DSL <em>outside</em> the
+     * {@code affectedTests {}} block — typically for source-set
+     * declarations, custom Test task wiring, or anything else that
+     * has to land at the top level of the build script. Used by
+     * the source-set auto-discovery scenarios (issue #49) which
+     * need to register an {@code integrationTest} source set + Test
+     * task before the plugin's {@code projectsEvaluated} hook fires.
+     */
+    public void extendBuildScript(String groovySnippet) throws IOException {
+        this.extraBuildScript = (this.extraBuildScript.isBlank() ? "" : this.extraBuildScript + "\n") + groovySnippet;
         writeBuildScript();
     }
 
@@ -348,7 +363,8 @@ public final class TestProject {
                 affectedTests {
                 """
                 + affectedTestsBlock
-                + "\n}\n";
+                + "\n}\n"
+                + (extraBuildScript.isBlank() ? "" : "\n" + extraBuildScript + "\n");
         Files.writeString(projectDir.resolve("build.gradle"), body);
     }
 }
