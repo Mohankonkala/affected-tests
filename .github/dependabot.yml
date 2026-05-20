@@ -1,0 +1,76 @@
+# Dependabot configuration for affected-tests.
+#
+# Two ecosystems:
+#   * GitHub Actions used in .github/workflows/*.yml
+#   * Gradle dependencies in the root build.gradle, both subproject
+#     build.gradle files, and any plugin pins in settings/plugins.
+#
+# Grouping minor + patch bumps for the noisy dependency families
+# (JUnit, Cucumber) keeps the PR queue legible — those families
+# move together upstream and do not need one PR per artifact.
+# Major bumps still come in as individual PRs so a breaking change
+# is reviewed on its own.
+#
+# See issue #52 for the rationale.
+
+version: 2
+updates:
+  # ── GitHub Actions ──────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "ci/release"
+    groups:
+      gh-actions-minor-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── Gradle (root + subprojects) ─────────────────────────────────
+  # Dependabot scans every build.gradle / settings.gradle under
+  # the configured directory, so a single entry covers
+  # affected-tests-core/build.gradle, affected-tests-gradle/build.gradle,
+  # and the root.
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 8
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    labels:
+      - "enhancement"
+    groups:
+      junit-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "org.junit:*"
+          - "org.junit.jupiter:*"
+          - "org.junit.platform:*"
+        update-types:
+          - "minor"
+          - "patch"
+      cucumber-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "io.cucumber:*"
+        update-types:
+          - "minor"
+          - "patch"
+      slf4j-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "org.slf4j:*"
+        update-types:
+          - "minor"
+          - "patch"
