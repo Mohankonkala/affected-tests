@@ -198,6 +198,113 @@ class AffectedTestsEngineTest {
     }
 
     @Test
+    void testOnlyDiffTakesFastPathAndStillFiltersDeletedTests() throws Exception {
+        // Regression for #45: a test-only diff (zero production classes
+        // changed) takes the runTestOnlyFastPath branch which skips
+        // ProjectIndex.build() entirely. Behaviour-preservation against
+        // the existing index path is what this test pins:
+        //
+        //   * the surviving (modified) test FQN is in the result with
+        //     its absolute path correctly mapped, AND
+        //   * the deleted test FQN is filtered out before reaching
+        //     downstream Gradle dispatch (otherwise --tests fails with
+        //     "No tests found").
+        //
+        // Same on-disk filter contract the index-driven path enforces;
+        // the fast-path implementation just runs Files.exists against
+        // each diff entry instead of consulting the workspace-wide
+        // testFqnToPath map.
+        try (Git git = initRepoWithInitialCommit()) {
+            Path testDir = tempDir.resolve("src/test/java/com/example");
+            Files.createDirectories(testDir);
+            Path keptTest = testDir.resolve("KeptTest.java");
+            Files.writeString(keptTest,
+                    "package com.example;\npublic class KeptTest {}");
+            Path goneTest = testDir.resolve("GoneTest.java");
+            Files.writeString(goneTest,
+                    "package com.example;\npublic class GoneTest {}");
+
+            git.add().addFilepattern(".").call();
+            git.commit().setMessage("baseline two tests").call();
+            String base = git.log().call().iterator().next().getName();
+
+            Files.writeString(keptTest,
+                    "package com.example;\npublic class KeptTest { void t() {} }");
+            Files.delete(goneTest);
+            git.add().addFilepattern(".").call();
+            git.add().setUpdate(true).addFilepattern(".").call();
+            git.commit().setMessage("modify Kept; delete Gone").call();
+
+            AffectedTestsConfig config = AffectedTestsConfig.builder()
+                    .baseRef(base)
+                    .includeUncommitted(false)
+                    .includeStaged(false)
+                    .build();
+
+            AffectedTestsEngine engine = new AffectedTestsEngine(config, tempDir);
+            AffectedTestsEngine.AffectedTestsResult result = engine.run();
+
+            assertEquals(Situation.DISCOVERY_SUCCESS, result.situation(),
+                    "Test-only diff with at least one surviving test must "
+                            + "still report DISCOVERY_SUCCESS — same outcome "
+                            + "the index-driven path produces.");
+            assertEquals(Action.SELECTED, result.action());
+            assertTrue(result.testClassFqns().contains("com.example.KeptTest"),
+                    "Modified test must be selected.");
+            assertFalse(result.testClassFqns().contains("com.example.GoneTest"),
+                    "Deleted test FQN must be filtered out — otherwise "
+                            + "Gradle's --tests fails with 'No tests found' "
+                            + "and the whole outer build dies.");
+            assertNotNull(result.testFqnToPath().get("com.example.KeptTest"),
+                    "Surviving test must map to its on-disk path so the "
+                            + "Gradle dispatch can route it to the right module.");
+            assertFalse(result.runAll());
+            assertFalse(result.skipped());
+        }
+    }
+
+    @Test
+    void testOnlyDiffWithAllTestsDeletedRoutesToDiscoveryEmpty() throws Exception {
+        // Companion: when the fast path filters out every candidate
+        // (every test in the diff was deleted), the engine must still
+        // produce a well-formed DISCOVERY_EMPTY result so the configured
+        // action for that situation decides the outcome — same shape the
+        // index-driven path produces.
+        try (Git git = initRepoWithInitialCommit()) {
+            Path testDir = tempDir.resolve("src/test/java/com/example");
+            Files.createDirectories(testDir);
+            Path doomedTest = testDir.resolve("DoomedTest.java");
+            Files.writeString(doomedTest,
+                    "package com.example;\npublic class DoomedTest {}");
+
+            git.add().addFilepattern(".").call();
+            git.commit().setMessage("baseline test").call();
+            String base = git.log().call().iterator().next().getName();
+
+            Files.delete(doomedTest);
+            git.add().addFilepattern(".").call();
+            git.add().setUpdate(true).addFilepattern(".").call();
+            git.commit().setMessage("delete test").call();
+
+            AffectedTestsConfig config = AffectedTestsConfig.builder()
+                    .baseRef(base)
+                    .includeUncommitted(false)
+                    .includeStaged(false)
+                    .mode(Mode.LOCAL)
+                    .build();
+
+            AffectedTestsEngine engine = new AffectedTestsEngine(config, tempDir);
+            AffectedTestsEngine.AffectedTestsResult result = engine.run();
+
+            assertEquals(Situation.DISCOVERY_EMPTY, result.situation());
+            assertTrue(result.testClassFqns().isEmpty());
+            assertTrue(result.skipped(),
+                    "DISCOVERY_EMPTY in LOCAL mode must skip — no tests to run "
+                            + "and no escalation justified by a pure-delete diff.");
+        }
+    }
+
+    @Test
     void forcesRunAllWhenNonJavaFileChangesAndFlagIsDefault() throws Exception {
         // Policy: "run more, never less" — any change to a file we cannot
         // resolve to a Java source or test class under the configured dirs
