@@ -410,6 +410,118 @@ class AffectedTestsConfigTest {
     }
 
     @Test
+    void testTaskNamesDefaultsToSingleTestEntry() {
+        // Backwards compatibility for every adopter that hasn't
+        // touched the new knob: the default must be exactly
+        // ['test'] so dispatch keeps emitting ':module:test' the
+        // way it always has. A regression that changes the
+        // default would silently re-route tests to a task that
+        // doesn't exist on the consumer's project.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        assertEquals(List.of("test"), config.testTaskNames(),
+                "Default testTaskNames must be ['test'] so existing adopters' "
+                        + "dispatch shape (':module:test') is preserved");
+    }
+
+    @Test
+    void testTaskNamesAcceptsCustomGradleTaskNames() {
+        // The happy path #48 enables: a multi-source-set adopter
+        // lists the extra task names. Whitespace, separators, and
+        // control characters were already covered by the
+        // negative tests below; this pin asserts that ordinary
+        // Gradle-conformant identifiers (camelCase, digits) round-
+        // trip through the builder unchanged.
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .testTaskNames(List.of("test", "integrationTest", "e2eTest", "test2"))
+                .build();
+        assertEquals(List.of("test", "integrationTest", "e2eTest", "test2"),
+                config.testTaskNames());
+    }
+
+    @Test
+    void testTaskNamesRejectsEmptyList() {
+        // An empty list at config time is operator error, not a
+        // silent "fall back to test". Failing fast at the builder
+        // means the misconfiguration surfaces with a clear stack
+        // pointing at the DSL line, instead of producing zero
+        // dispatched tests at MR time (which would look like a
+        // test-run pass).
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> AffectedTestsConfig.builder().testTaskNames(List.of()).build());
+        assertTrue(ex.getMessage().contains("at least one"),
+                "Error must guide the operator toward the default. Got: " + ex.getMessage());
+    }
+
+    @Test
+    void testTaskNamesRejectsNamesContainingColon() {
+        // ':' is the Gradle path separator. An entry like
+        // ":app:test" would forge a malformed task path on
+        // dispatch (":module::app:test"). The validator catches
+        // it at config time with a diagnostic that names the
+        // offending character — so the operator can fix the DSL,
+        // not chase a Gradle "task not found" error from a
+        // garbled path two layers down.
+        IllegalArgumentException ex = assertThrows(IllegalArgumentException.class,
+                () -> AffectedTestsConfig.builder()
+                        .testTaskNames(List.of("test", ":integrationTest"))
+                        .build());
+        assertTrue(ex.getMessage().contains("illegal character"),
+                "Error must call out the character class. Got: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains(":integrationTest"),
+                "Error must echo the offending entry. Got: " + ex.getMessage());
+    }
+
+    @Test
+    void testTaskNamesRejectsBlankOrWhitespaceEntries() {
+        // Blank or whitespace-only names would forge an empty
+        // task path on dispatch. Reject them at config time so
+        // the operator doesn't see a "task '' not found" error
+        // from the nested Gradle invocation.
+        assertThrows(IllegalArgumentException.class,
+                () -> AffectedTestsConfig.builder()
+                        .testTaskNames(List.of("test", ""))
+                        .build());
+        assertThrows(IllegalArgumentException.class,
+                () -> AffectedTestsConfig.builder()
+                        .testTaskNames(List.of("test", "  "))
+                        .build());
+        assertThrows(IllegalArgumentException.class,
+                () -> AffectedTestsConfig.builder()
+                        .testTaskNames(List.of("test", "integration test"))
+                        .build());
+    }
+
+    @Test
+    void testTaskNamesRejectsForwardSlashAndBackslash() {
+        // '/' would let an attacker-planted DSL forge a path
+        // outside the project. Backslash isn't a Gradle separator,
+        // but rejecting it keeps the validator portable across
+        // Windows and Unix and matches the same posture
+        // testDirs takes.
+        assertThrows(IllegalArgumentException.class,
+                () -> AffectedTestsConfig.builder()
+                        .testTaskNames(List.of("test", "../test"))
+                        .build());
+        assertThrows(IllegalArgumentException.class,
+                () -> AffectedTestsConfig.builder()
+                        .testTaskNames(List.of("test", "test\\evil"))
+                        .build());
+    }
+
+    @Test
+    void testTaskNamesIsImmutable() {
+        // Defence in depth: if the caller mutates the list after
+        // build(), config.testTaskNames() must not see it. A
+        // mutable view would let a delayed thread (e.g. a build
+        // listener) re-route dispatch on every MR.
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .testTaskNames(List.of("test", "integrationTest"))
+                .build();
+        assertThrows(UnsupportedOperationException.class,
+                () -> config.testTaskNames().add("e2eTest"));
+    }
+
+    @Test
     void effectiveModeIsAlwaysConcreteForZeroConfigCallers() {
         // Regression: pre-fix, a zero-config caller got mode()=AUTO and
         // effectiveMode()=null, despite the javadoc's "Always one of

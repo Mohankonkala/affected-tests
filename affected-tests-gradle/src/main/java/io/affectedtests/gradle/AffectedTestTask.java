@@ -158,6 +158,17 @@ public abstract class AffectedTestTask extends DefaultTask {
     public abstract ListProperty<String> getTestDirs();
 
     /**
+     * Names of the Gradle test tasks the dispatch path may invoke.
+     * Default: {@code ["test"]}. See
+     * {@link AffectedTestsExtension#getTestTaskNames} for the
+     * routing semantics.
+     *
+     * @return the test task names list property
+     */
+    @Input
+    public abstract ListProperty<String> getTestTaskNames();
+
+    /**
      * Glob patterns for files that must never influence test selection.
      * Optional — when unset, the core config's default list applies.
      *
@@ -393,13 +404,9 @@ public abstract class AffectedTestTask extends DefaultTask {
                 // so the --explain preview names the EXACT tasks
                 // that would run in a non-explain dispatch — anything
                 // less defeats the point of the diagnostic.
-                Map<String, List<String>> rawGroups = groupFqnsByModule(
-                        projectDir, result.testClassFqns(), result.testFqnToPath());
-                Map<String, List<String>> taskKeyed = new LinkedHashMap<>(rawGroups.size());
-                for (Map.Entry<String, List<String>> e : rawGroups.entrySet()) {
-                    taskKeyed.put(testTaskPath(e.getKey()), e.getValue());
-                }
-                moduleGroupsForExplain = taskKeyed;
+                moduleGroupsForExplain = groupFqnsByTaskKey(
+                        projectDir, result.testClassFqns(), result.testFqnToPath(),
+                        config.testTaskNames());
             }
             String format = resolveExplainFormat(getExplainFormat().getOrNull());
             if ("json".equals(format)) {
@@ -454,7 +461,8 @@ public abstract class AffectedTestTask extends DefaultTask {
                 result.testClassFqns(),
                 result.testFqnToPath(),
                 result.runAll(),
-                config.gradlewTimeoutSeconds());
+                config.gradlewTimeoutSeconds(),
+                config.testTaskNames());
     }
 
     /**
@@ -473,6 +481,7 @@ public abstract class AffectedTestTask extends DefaultTask {
                 .testSuffixes(getTestSuffixes().get())
                 .sourceDirs(getSourceDirs().get())
                 .testDirs(getTestDirs().get())
+                .testTaskNames(getTestTaskNames().get())
                 .includeImplementationTests(getIncludeImplementationTests().get())
                 .implementationNaming(getImplementationNaming().get());
 
@@ -560,7 +569,8 @@ public abstract class AffectedTestTask extends DefaultTask {
                               Set<String> testFqns,
                               Map<String, Path> fqnToPath,
                               boolean runAll,
-                              long gradlewTimeoutSeconds) {
+                              long gradlewTimeoutSeconds,
+                              List<String> testTaskNames) {
         String gradleCommand = resolveGradleCommand(projectDir);
 
         List<String> args = new ArrayList<>();
@@ -577,11 +587,14 @@ public abstract class AffectedTestTask extends DefaultTask {
             getLogger().lifecycle("Running ALL tests.");
             args.add("test");
         } else {
-            // Group FQNs by owning subproject and emit ":moduleA:test --tests x
-            // :moduleB:test --tests y" so Gradle's --tests filters don't spill
-            // across modules (where they'd fail any subproject that doesn't
-            // happen to contain the FQN).
-            Map<String, List<String>> grouped = groupFqnsByModule(projectDir, testFqns, fqnToPath);
+            // Group FQNs by owning subproject AND owning test task
+            // (issue #48), then emit one nested ":moduleA:test --tests x
+            // :moduleA:integrationTest --tests y" invocation per
+            // (module × task) pair so Gradle's --tests filters don't
+            // spill across modules or across source sets (where they'd
+            // fail any task that doesn't happen to contain the FQN).
+            Map<String, List<String>> grouped = groupFqnsByTaskKey(
+                    projectDir, testFqns, fqnToPath, testTaskNames);
 
             // Validate every discovered FQN up front so the header,
             // per-module preview, and argv-append stay arithmetically
@@ -595,7 +608,7 @@ public abstract class AffectedTestTask extends DefaultTask {
             Map<String, List<String>> validatedGroups = new LinkedHashMap<>(grouped.size());
             int totalValid = 0;
             for (Map.Entry<String, List<String>> entry : grouped.entrySet()) {
-                String taskPath = testTaskPath(entry.getKey());
+                String taskPath = entry.getKey();
                 List<String> valid = new ArrayList<>(entry.getValue().size());
                 for (String fqn : entry.getValue()) {
                     if (!isValidFqn(fqn)) {
@@ -906,7 +919,77 @@ public abstract class AffectedTestTask extends DefaultTask {
      * preview unambiguous.
      */
     static String testTaskPath(String modulePath) {
-        return modulePath.isEmpty() ? ":test" : modulePath + ":test";
+        return testTaskPath(modulePath, "test");
+    }
+
+    /**
+     * Per-task variant introduced in #48 so adopters with extra
+     * source sets ({@code integrationTest}, {@code e2eTest}, etc.)
+     * can route discovered FQNs to the right Gradle task. Same
+     * leading-colon contract as the 1-arg form: the result always
+     * starts with {@code ':'} so {@code appendModulesBlock}'s
+     * canonical-key assertion stays valid.
+     *
+     * @param modulePath {@code ""} for the root project, otherwise a
+     *                   {@code :sub:project} path
+     * @param taskName   the Gradle test task name (e.g. {@code "test"},
+     *                   {@code "integrationTest"})
+     */
+    static String testTaskPath(String modulePath, String taskName) {
+        return modulePath.isEmpty() ? ":" + taskName : modulePath + ":" + taskName;
+    }
+
+    /**
+     * Picks the Gradle test task name that owns the given test file,
+     * by Gradle's source-set convention {@code src/<taskName>/java}
+     * (or {@code src/<taskName>/kotlin} / {@code src/<taskName>/groovy}
+     * — same name segment, different language root). Walks the
+     * configured task-name list in order so adopters can express a
+     * priority for ambiguous shapes (an integration test under
+     * {@code src/integrationTest/java} that also matches a
+     * less-specific generic task name resolves to the more specific
+     * entry as long as it's listed first).
+     *
+     * <p>Falls back to the first entry in {@code testTaskNames}
+     * (which defaults to {@code "test"}) when no source-set segment
+     * matches — same conservative posture {@link #resolveOwningModule}
+     * takes when subproject resolution fails. Never returns
+     * {@code null}; the caller's contract is "this FQN goes to
+     * <em>some</em> task" so a quiet routing failure would be a
+     * regression of the kind v2.2.1 was raised to surface.
+     *
+     * <p>Package-private so {@code AffectedTestTaskTaskRoutingTest}
+     * can pin both the segment-matching path and the fallback path
+     * without spinning up a Gradle test runtime.
+     */
+    static String resolveTaskNameForFile(Path file, List<String> testTaskNames) {
+        // Defensive: builder validation rejects empty / null lists,
+        // but unit tests drive the helper directly with arbitrary
+        // arguments. Returning "test" matches the documented default
+        // and keeps the helper safe to call in any test fixture.
+        if (testTaskNames == null || testTaskNames.isEmpty()) {
+            return "test";
+        }
+        if (file == null) {
+            return testTaskNames.get(0);
+        }
+        String normalized = file.toString().replace(File.separatorChar, '/');
+        for (String taskName : testTaskNames) {
+            // The segment we're looking for is `/src/<taskName>/`
+            // — strict on both delimiters so a longer name like
+            // `integrationTestPart` doesn't false-match a shorter
+            // configured `integrationTest` (or vice versa). The
+            // alternative — a substring search — would silently
+            // route an `integrationTestPart` test to the
+            // `integrationTest` task on some adopters' source-set
+            // layouts, which is exactly the silent mis-route #48
+            // is meant to prevent.
+            String marker = "/src/" + taskName + "/";
+            if (normalized.contains(marker)) {
+                return taskName;
+            }
+        }
+        return testTaskNames.get(0);
     }
 
     /**
@@ -935,6 +1018,38 @@ public abstract class AffectedTestTask extends DefaultTask {
             grouped.computeIfAbsent(moduleGradlePath, k -> new ArrayList<>()).add(fqn);
         }
         return grouped;
+    }
+
+    /**
+     * Per-task-key grouping introduced by #48: runs
+     * {@link #groupFqnsByModule} to find each FQN's owning module,
+     * then post-processes the result by splitting each module bucket
+     * into per-task buckets via {@link #resolveTaskNameForFile}.
+     * Returns a map keyed by the canonical {@code :module:taskName}
+     * Gradle path so dispatch and {@code --explain} can iterate
+     * without re-running the helper.
+     *
+     * <p>Insertion order is module-first then task-first (within a
+     * module) so a multi-source-set project's {@code --explain}
+     * output groups by module — which is the shape adopters
+     * naturally read.
+     */
+    private Map<String, List<String>> groupFqnsByTaskKey(Path projectDir,
+                                                         Set<String> testFqns,
+                                                         Map<String, Path> fqnToPath,
+                                                         List<String> testTaskNames) {
+        Map<String, List<String>> byModule = groupFqnsByModule(projectDir, testFqns, fqnToPath);
+        Map<String, List<String>> byTaskKey = new LinkedHashMap<>(byModule.size());
+        for (Map.Entry<String, List<String>> entry : byModule.entrySet()) {
+            String modulePath = entry.getKey();
+            for (String fqn : entry.getValue()) {
+                Path file = fqnToPath.get(fqn);
+                String taskName = resolveTaskNameForFile(file, testTaskNames);
+                String taskKey = testTaskPath(modulePath, taskName);
+                byTaskKey.computeIfAbsent(taskKey, k -> new ArrayList<>()).add(fqn);
+            }
+        }
+        return byTaskKey;
     }
 
     private String resolveOwningModule(Path projectDir, Path file,

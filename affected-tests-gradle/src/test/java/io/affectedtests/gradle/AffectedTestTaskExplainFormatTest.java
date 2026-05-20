@@ -867,6 +867,56 @@ class AffectedTestTaskExplainFormatTest {
     }
 
     @Test
+    void modulesBlockRendersDistinctRowsForMultipleTestTasksInOneModule() {
+        // Issue #48: an adopter with `testTaskNames = ['test',
+        // 'integrationTest']` ends up with two task keys for the
+        // same subproject — :app:test and :app:integrationTest.
+        // The renderer must surface both rows distinctly so the
+        // operator can see, at a glance, which source set fired.
+        // A regression that collapses them into a single :app:test
+        // row would silently misrepresent dispatch in --explain
+        // even while the actual command line stayed correct,
+        // which is the kind of trace/dispatch drift v2.2.1's
+        // testTaskPath contract was raised to prevent.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of("com.example.FooTest", "com.example.FooIT"), Map.of(),
+                Set.of("app/src/main/java/com/example/Foo.java"),
+                Set.of("com.example.Foo"),
+                Set.of("com.example.FooTest", "com.example.FooIT"),
+                new Buckets(Set.of(), Set.of(),
+                        Set.of("app/src/main/java/com/example/Foo.java"),
+                        Set.of(), Set.of()),
+                false, false,
+                Situation.DISCOVERY_SUCCESS, Action.SELECTED,
+                EscalationReason.NONE);
+
+        // Both keys must originate from testTaskPath so the
+        // renderer's leading-colon assertion stays satisfied.
+        Map<String, List<String>> moduleGroups = new java.util.LinkedHashMap<>();
+        moduleGroups.put(AffectedTestTask.testTaskPath(":app", "test"),
+                List.of("com.example.FooTest"));
+        moduleGroups.put(AffectedTestTask.testTaskPath(":app", "integrationTest"),
+                List.of("com.example.FooIT"));
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result, moduleGroups));
+
+        assertTrue(trace.contains(":app:test (1 test class)"),
+                "Same-module 'test' row must render alongside its integrationTest sibling. "
+                        + "Got:\n" + trace);
+        assertTrue(trace.contains(":app:integrationTest (1 test class)"),
+                "Same-module 'integrationTest' row must render distinct from the 'test' row "
+                        + "so the source set is visible in --explain. Got:\n" + trace);
+        // Header arithmetic must reflect 2 keys, not 1 (a
+        // collapse-bug would say "1 module"; this guards both
+        // numerator and denominator of the explain header).
+        assertTrue(trace.contains("Modules:         2 modules, 2 test classes to dispatch"),
+                "Header must count distinct task keys, not distinct subprojects — otherwise "
+                        + "a multi-source-set adopter sees '1 module, 2 classes' which "
+                        + "obscures the routing. Got:\n" + trace);
+    }
+
+    @Test
     void modulesBlockRejectsKeysThatSkipTheTestTaskPathHelper() {
         // v2.2.1 fix (L2 from v2.2 code review): appendModulesBlock
         // used to silently re-normalise keys missing a leading colon,

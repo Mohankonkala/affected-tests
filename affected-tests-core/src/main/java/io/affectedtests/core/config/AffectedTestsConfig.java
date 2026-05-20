@@ -45,6 +45,7 @@ public final class AffectedTestsConfig {
     private final List<String> testSuffixes;
     private final List<String> sourceDirs;
     private final List<String> testDirs;
+    private final List<String> testTaskNames;
     private final List<String> ignorePaths;
     private final List<String> outOfScopeTestDirs;
     private final List<String> outOfScopeSourceDirs;
@@ -65,6 +66,7 @@ public final class AffectedTestsConfig {
         this.testSuffixes = List.copyOf(builder.testSuffixes);
         this.sourceDirs = List.copyOf(builder.sourceDirs);
         this.testDirs = List.copyOf(builder.testDirs);
+        this.testTaskNames = List.copyOf(builder.testTaskNames);
         this.includeImplementationTests = builder.includeImplementationTests;
         this.implementationNaming = List.copyOf(builder.implementationNaming);
         // Zero = no timeout, preserving the pre-v1.9.22 "wait forever"
@@ -193,6 +195,23 @@ public final class AffectedTestsConfig {
     public List<String> testSuffixes() { return testSuffixes; }
     public List<String> sourceDirs() { return sourceDirs; }
     public List<String> testDirs() { return testDirs; }
+    /**
+     * Names of the Gradle test tasks the dispatch path may invoke
+     * (one nested {@code ./gradlew} call per {@code module × taskName}
+     * pair). Default: {@code ["test"]} — the only Gradle convention
+     * task name that exists on a fresh Java plugin install.
+     *
+     * <p>Adopters with extra source sets ({@code integrationTest},
+     * {@code e2eTest}, etc.) opt those tasks in by listing them here:
+     * {@code testTaskNames = ["test", "integrationTest"]}. The
+     * dispatch path then routes each discovered FQN to the task whose
+     * source-set directory the FQN's file sits under, by the standard
+     * Gradle convention {@code src/<taskName>/java}. FQNs that do
+     * not match any listed task fall back to the first entry — the
+     * same conservative posture the rest of the plugin takes when an
+     * input shape is ambiguous.
+     */
+    public List<String> testTaskNames() { return testTaskNames; }
 
     /**
      * Hard wall-clock timeout applied to the nested {@code ./gradlew}
@@ -369,6 +388,7 @@ public final class AffectedTestsConfig {
         private List<String> testSuffixes = List.of("Test", "IT", "ITTest", "IntegrationTest");
         private List<String> sourceDirs = List.of("src/main/java");
         private List<String> testDirs = List.of("src/test/java");
+        private List<String> testTaskNames = List.of("test");
         private List<String> ignorePaths;
         private List<String> outOfScopeTestDirs;
         private List<String> outOfScopeSourceDirs;
@@ -520,6 +540,48 @@ public final class AffectedTestsConfig {
         }
         public Builder testDirs(List<String> v) {
             this.testDirs = Objects.requireNonNull(v, "testDirs must not be null");
+            return this;
+        }
+
+        /**
+         * Sets the list of Gradle test task names the dispatch path
+         * may invoke. See {@link AffectedTestsConfig#testTaskNames()}
+         * for the routing semantics. Empty / null lists are rejected;
+         * task names containing whitespace, control characters, or
+         * Gradle path separators ({@code ':' / '/'}) are also
+         * rejected — those would forge a malformed task path that
+         * the nested Gradle invocation would mis-parse, and the same
+         * "fail at config time, not at dispatch time" posture
+         * {@link #baseRef(String)} takes applies here.
+         */
+        public Builder testTaskNames(List<String> v) {
+            Objects.requireNonNull(v, "testTaskNames must not be null");
+            if (v.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "testTaskNames must contain at least one task name "
+                                + "(default: ['test']).");
+            }
+            for (String name : v) {
+                if (name == null || name.isBlank()) {
+                    throw new IllegalArgumentException(
+                            "testTaskNames entries must be non-blank.");
+                }
+                for (int i = 0; i < name.length(); i++) {
+                    char c = name.charAt(i);
+                    if (c == ':' || c == '/' || c == '\\'
+                            || Character.isWhitespace(c)
+                            || Character.isISOControl(c)) {
+                        throw new IllegalArgumentException(
+                                "testTaskNames entry '" + name + "' contains an "
+                                        + "illegal character at index " + i
+                                        + ". Task names must not contain ':' / "
+                                        + "'/' / whitespace / control characters "
+                                        + "— those forge a malformed Gradle task "
+                                        + "path on dispatch.");
+                    }
+                }
+            }
+            this.testTaskNames = v;
             return this;
         }
 

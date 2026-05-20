@@ -66,6 +66,7 @@ public class AffectedTestsPlugin implements Plugin<Project> {
         extension.getTestSuffixes().convention(List.of("Test", "IT", "ITTest", "IntegrationTest"));
         extension.getSourceDirs().convention(List.of("src/main/java"));
         extension.getTestDirs().convention(List.of("src/test/java"));
+        extension.getTestTaskNames().convention(List.of("test"));
         // No convention for ignorePaths: an empty Gradle provider is how
         // we signal "let the core config builder pick the default list".
         // Setting a convention here would stop callers who want to
@@ -90,6 +91,7 @@ public class AffectedTestsPlugin implements Plugin<Project> {
             task.getTestSuffixes().set(extension.getTestSuffixes());
             task.getSourceDirs().set(extension.getSourceDirs());
             task.getTestDirs().set(extension.getTestDirs());
+            task.getTestTaskNames().set(extension.getTestTaskNames());
             task.getIgnorePaths().set(extension.getIgnorePaths());
             task.getOutOfScopeTestDirs().set(extension.getOutOfScopeTestDirs());
             task.getOutOfScopeSourceDirs().set(extension.getOutOfScopeSourceDirs());

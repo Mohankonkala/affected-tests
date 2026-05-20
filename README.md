@@ -326,6 +326,14 @@ affectedTests {
     // Test directories (default: ["src/test/java"])
     testDirs = ["src/test/java"]
 
+    // Gradle test task names the dispatch path may invoke (default: ["test"]).
+    // Adopters with extra source sets list them here so discovered tests
+    // route to the right task by Gradle's `src/<taskName>/java` convention.
+    // Most users keep the default; opt in only when an `integrationTest` /
+    // `e2eTest` task exists *and* its source directory is also added to
+    // `testDirs` so discovery can see those tests.
+    testTaskNames = ["test", "integrationTest"]
+
     // Include tests for implementations of changed interfaces (default: true)
     includeImplementationTests = true
 
