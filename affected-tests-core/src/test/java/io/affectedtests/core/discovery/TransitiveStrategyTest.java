@@ -261,6 +261,99 @@ class TransitiveStrategyTest {
     }
 
     @Test
+    void lazyWalkParsesOnlyFilesReachableFromTheFrontier() throws IOException {
+        // Regression for #43: the pre-#43 implementation parsed every
+        // source file in the project to build the reverse dependency
+        // map upfront, even when the diff only touched a leaf class
+        // with a handful of consumers. On a 10k-class monorepo with a
+        // 1-line diff that's 10k AST parses for no useful information.
+        //
+        // The lazy frontier-first walk parses only files that the
+        // text-based simple-name index flags as plausibly referencing
+        // the current frontier. This test synthesises a 50-class
+        // harness where only 3 files (1 direct consumer + 2
+        // transitive consumers) actually reach the changed FQN, then
+        // confirms the parse count stays bounded by reachability
+        // rather than corpus size.
+        //
+        // The bound chosen here (< half the corpus) is deliberately
+        // loose so the test pins the "lazy" contract without
+        // committing to a specific tokenizer regex; making the bound
+        // tight enough to fail on minor regex tweaks would invert the
+        // signal-to-noise of this regression. The acceptance criterion
+        // in the issue suggests "<50 ASTs out of 1000" — same
+        // proportion (5%) as 3-of-50 here. Keeping the harness small
+        // keeps the test fast.
+        Path prodDir = tempDir.resolve("src/main/java/com/example");
+        Files.createDirectories(prodDir);
+
+        // Changed target: Foo. 1 direct consumer (UsesFoo) + 1
+        // transitive consumer (UsesUsesFoo). Both reach the changed
+        // FQN. Everything else is unrelated noise.
+        Files.writeString(prodDir.resolve("Foo.java"),
+                "package com.example;\npublic class Foo {}");
+        Files.writeString(prodDir.resolve("UsesFoo.java"), """
+                package com.example;
+
+                public class UsesFoo {
+                    private Foo foo;
+                }
+                """);
+        Files.writeString(prodDir.resolve("UsesUsesFoo.java"), """
+                package com.example;
+
+                public class UsesUsesFoo {
+                    private UsesFoo usesFoo;
+                }
+                """);
+
+        // 47 unrelated files that do NOT reference Foo or UsesFoo. The
+        // pre-#43 implementation would have parsed every one; the
+        // post-#43 implementation must not.
+        for (int i = 0; i < 47; i++) {
+            Files.writeString(prodDir.resolve("Unrelated" + i + ".java"),
+                    "package com.example;\npublic class Unrelated" + i
+                            + " { private String id; }");
+        }
+
+        // Use the ProjectIndex code path so we can count parses.
+        // Direct projectDir-based discovery works too but goes through
+        // a one-shot parser without the cache count surface.
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .transitiveDepth(2)
+                .build();
+        NamingConventionStrategy naming = new NamingConventionStrategy(config);
+        UsageStrategy usage = new UsageStrategy(config);
+        TransitiveStrategy lazy = new TransitiveStrategy(config, naming, usage);
+
+        ProjectIndex index = ProjectIndex.build(tempDir, config);
+        assertEquals(50, index.sourceFiles().size(),
+                "Sanity: harness must contain exactly 50 source files");
+        assertEquals(0, index.parsedFileCount(),
+                "Sanity: index must not parse anything during construction");
+
+        Set<String> result = lazy.discoverTests(Set.of("com.example.Foo"), index);
+
+        assertTrue(result.isEmpty(),
+                "No tests in the harness — the assertion is on parse count, "
+                        + "not on the discovered set");
+        // Hard ceiling: 50% of corpus. With 3 reachable files plus a
+        // small amount of false-positive over-match from the text
+        // index (e.g. files mentioning "String" — not relevant here
+        // because we're querying "Foo", but the cap absorbs that
+        // class of noise) the realistic count should be well below
+        // 25. Setting the bar at 25 keeps the test stable across
+        // regex refinements while still failing loudly if we ever
+        // regress to "parse everything".
+        int parsed = index.parsedFileCount();
+        assertTrue(parsed < 25,
+                "Lazy walk must parse fewer than half the corpus; "
+                        + "actually parsed " + parsed + "/50. "
+                        + "If this regressed, TransitiveStrategy is parsing every "
+                        + "source file again — the very thing #43 fixed.");
+    }
+
+    @Test
     void discoversConsumerTestsForDeletedProductionClass() throws IOException {
         // The fixture mirrors a `git rm FooService.java` MR: FooService is in
         // the changed set (surfaced by GitChangeDetector via the old path)

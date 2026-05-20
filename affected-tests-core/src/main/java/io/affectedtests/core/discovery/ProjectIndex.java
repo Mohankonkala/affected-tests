@@ -194,4 +194,25 @@ public final class ProjectIndex {
     public int parseFailureCount() {
         return parseFailureCount;
     }
+
+    /**
+     * Number of distinct files for which {@link #compilationUnit(Path)}
+     * has been called during this engine run (regardless of whether
+     * the parse succeeded or failed). Backed by the lazy CU cache:
+     * a file added on first request, never re-added on subsequent
+     * cache hits.
+     *
+     * <p>Consumed by {@code TransitiveStrategyTest} to pin the
+     * frontier-first lazy-walk contract from issue #43: on a 1k-file
+     * harness where only a handful of files reach the changed FQN,
+     * the parsed-file count must stay well below the source-file
+     * total. Without this accessor the test would have to scrape
+     * log output, which is brittle across log-config changes.
+     *
+     * @return the count of distinct files that have been requested
+     *         from {@link #compilationUnit(Path)} so far
+     */
+    public int parsedFileCount() {
+        return cuCache.size();
+    }
 }

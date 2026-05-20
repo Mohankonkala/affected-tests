@@ -8,8 +8,12 @@ import io.affectedtests.core.config.AffectedTestsConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Strategy: Reverse Transitive / "Used-by".
@@ -20,10 +24,80 @@ import java.util.*;
  * discovers tests for those consumers via the naming and usage strategies.
  * <p>
  * Depth is configurable via {@code transitiveDepth} (default 4, max 5).
+ *
+ * <h3>Performance posture (issue #43)</h3>
+ *
+ * <p>The pre-#43 implementation built the reverse dependency map by parsing
+ * the AST of <em>every</em> source file in the project, regardless of
+ * whether the file could possibly contribute to the BFS frontier. On a
+ * 10k-class monorepo with a small diff that only touches a few leaf
+ * classes, that was 10k AST parses for no useful information beyond
+ * "no edge to the changed leaf."
+ *
+ * <p>The current implementation is frontier-first and lazy:
+ *
+ * <ol>
+ *   <li>A cheap text-only {@link SimpleNameTextIndex} is built once at
+ *       the start of the walk: it tokenises each source file's content
+ *       for uppercase-leading identifiers (Java's type-name shape) and
+ *       keys them by simple name → set of files mentioning that
+ *       name. No AST is constructed; no JavaParser is invoked. The
+ *       index over-matches deliberately (constants, type variables,
+ *       string-literal contents) — false positives only trigger
+ *       parses, never unsafe edges.</li>
+ *   <li>The BFS expands one frontier FQN at a time. For each frontier
+ *       FQN, the text index produces a candidate-file set bounded by
+ *       "files that mention this simple name." Only those files get
+ *       parsed (via the shared {@link ProjectIndex} CU cache so the
+ *       same file parses at most once per engine run). Each parsed
+ *       file is then resolved precisely (import map + wildcard +
+ *       same-package) to confirm whether the simple-name reference
+ *       resolves to the frontier FQN; only confirmed consumers feed
+ *       the next frontier.</li>
+ * </ol>
+ *
+ * <p>For a sparse graph (the typical case), this turns
+ * O(allSourceFiles × averageReferencedTypes) into roughly
+ * O(transitivelyReachable × averageReferencedTypes). The full-graph
+ * worst case is unchanged (every file reaches the changed set
+ * transitively, every file gets parsed), but that's also the scenario
+ * where the user genuinely wants the full reverse graph anyway.
+ *
+ * <p>Correctness invariants preserved against the pre-#43 fixture set:
+ *
+ * <ul>
+ *   <li><b>Generics</b> (e.g. {@code List<FooService>}) — text scan
+ *       picks up {@code FooService} as a separate uppercase token,
+ *       so the consumer's file becomes a candidate.</li>
+ *   <li><b>Method-body references</b> (e.g.
+ *       {@code new PricingCalculator()}) — same. The text scan does
+ *       not look at AST structure, only at identifier-shape tokens
+ *       in the file content.</li>
+ *   <li><b>Deleted production classes</b> — {@code extraKnownFqns}
+ *       (sourced from {@code changedProductionClasses}) is unioned
+ *       into the resolution step's known-FQN set so reverse edges
+ *       to a {@code git rm}-deleted class still resolve.</li>
+ * </ul>
  */
 public final class TransitiveStrategy implements TestDiscoveryStrategy {
 
     private static final Logger log = LoggerFactory.getLogger(TransitiveStrategy.class);
+
+    /**
+     * Pattern for "looks like a Java type name": ASCII letters/_/$
+     * starting with uppercase, optionally followed by digits or
+     * inner-class delimiter. Deliberately broader than strict type-
+     * name resolution — over-matching here only adds false-positive
+     * candidate files that the parse step then rejects, which is
+     * cheaper than risking an under-match (a missed edge would silently
+     * drop a consumer's tests, the exact regression #43 must not
+     * introduce). Tokens like {@code MAX_VALUE} or string-literal
+     * contents that start with uppercase are deliberately picked up;
+     * the parse step ignores them because they don't appear as
+     * {@code ClassOrInterfaceType} nodes.
+     */
+    private static final Pattern UPPERCASE_IDENT =
+            Pattern.compile("\\b[A-Z][A-Za-z0-9_$]*\\b");
 
     private final AffectedTestsConfig config;
     private final NamingConventionStrategy namingStrategy;
@@ -65,45 +139,58 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
             log.debug("[transitive] Transitive depth is 0, skipping");
             return discoveredTests;
         }
+        if (changedProductionClasses.isEmpty()) {
+            // Nothing to walk from. Defensive: callers don't currently
+            // hit this branch (the engine short-circuits on test-only
+            // diffs before invoking transitive), but it would be wrong
+            // to build the text index for an empty starting set.
+            return discoveredTests;
+        }
+
+        JavaParser fallbackParser = (index == null) ? JavaParsers.newParser() : null;
+
+        // Cheap path-derived FQN map. Used for resolution only; built
+        // once and reused across BFS depths. {@code extraKnownFqns}
+        // (== changedProductionClasses) is unioned in so reverse edges
+        // to a `git rm`-deleted class still resolve — see the
+        // {@code discoversConsumerTestsForDeletedProductionClass}
+        // regression in TransitiveStrategyTest for the contract.
+        Map<String, Path> fqnToFile = new HashMap<>();
+        Set<String> allKnownFqns = new HashSet<>();
+        for (Path file : sourceFiles) {
+            String fqn = pathToFqn(file);
+            if (fqn != null) {
+                fqnToFile.put(fqn, file);
+                allKnownFqns.add(fqn);
+            }
+        }
+        allKnownFqns.addAll(changedProductionClasses);
+
+        // Cheap text-only reverse index — built once, reused across
+        // every BFS depth. Reading each source file once and tokenising
+        // for uppercase identifiers is dramatically cheaper than
+        // parsing every file's AST upfront, which is the pre-#43 cost
+        // we're trying to avoid.
+        SimpleNameTextIndex textIndex = SimpleNameTextIndex.build(sourceFiles);
 
         Set<String> currentLevel = new LinkedHashSet<>(changedProductionClasses);
         Set<String> allVisited = new LinkedHashSet<>(changedProductionClasses);
 
-        // The changed set is threaded into map construction so reverse edges
-        // pointing at a class that was just `git rm`'d still get recorded.
-        // Without this, a pure-delete MR (file on disk is gone, consumers
-        // still reference the FQN from their still-present sources) produces
-        // an empty `dependencyMap.get(deletedFqn)`, and the downstream tests
-        // that are now broken against the deleted symbol are silently skipped.
-        // GitChangeDetector already surfaces the old path for DELETEs to seed
-        // `changedProductionClasses`; this patch closes the other half of the
-        // contract on the index side.
-        Map<String, Set<String>> dependencyMap =
-                buildReverseDependencyMap(sourceFiles, index, changedProductionClasses);
-
         // Collect the union of every depth's consumers BEFORE running naming
-        // / usage. Pre-this-change, naming + usage ran once per depth on each
-        // depth's `nextLevel` set, so a default `transitiveDepth = 4` walk
-        // re-scanned every test file four times. Both strategies are pure
-        // functions of their input class set — naming.discover(A) ∪
-        // naming.discover(B) ≡ naming.discover(A ∪ B), and the same holds
-        // for usage — so deferring the strategy invocation to the end of
-        // the BFS and running it once on the union is behaviour-preserving
-        // and removes (depth − 1) full passes through the test corpus.
+        // / usage. Pre-#44, naming + usage ran once per depth on each depth's
+        // `nextLevel` set, so a default `transitiveDepth = 4` walk re-scanned
+        // every test file four times. Both strategies are pure functions of
+        // their input class set — naming.discover(A) ∪ naming.discover(B) ≡
+        // naming.discover(A ∪ B), and the same holds for usage — so deferring
+        // the strategy invocation to the end of the BFS and running it once
+        // on the union is behaviour-preserving and removes (depth − 1) full
+        // passes through the test corpus.
         Set<String> transitiveConsumers = new LinkedHashSet<>();
 
         for (int depth = 1; depth <= config.transitiveDepth(); depth++) {
-            Set<String> nextLevel = new LinkedHashSet<>();
-
-            for (String classFqn : currentLevel) {
-                Set<String> deps = dependencyMap.getOrDefault(classFqn, Set.of());
-                for (String dep : deps) {
-                    if (!allVisited.contains(dep)) {
-                        nextLevel.add(dep);
-                        allVisited.add(dep);
-                    }
-                }
-            }
+            Set<String> nextLevel = expandFrontier(
+                    currentLevel, textIndex, fqnToFile, allKnownFqns,
+                    allVisited, index, fallbackParser);
 
             if (nextLevel.isEmpty()) {
                 log.debug("[transitive] No more downstream types at depth {}", depth);
@@ -112,12 +199,14 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
 
             log.debug("[transitive] Depth {}: found {} downstream types", depth, nextLevel.size());
 
+            allVisited.addAll(nextLevel);
             transitiveConsumers.addAll(nextLevel);
             currentLevel = nextLevel;
         }
 
         // One pass through all test files for naming, one for usage, against
-        // the union of every depth's consumers.
+        // the union of every depth's consumers (the #44 deferred-strategy
+        // contract).
         if (!transitiveConsumers.isEmpty()) {
             if (index != null) {
                 discoveredTests.addAll(namingStrategy.discoverTests(transitiveConsumers, index));
@@ -134,110 +223,159 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
     }
 
     /**
-     * Builds a <em>reverse</em> dependency map: for each production class FQN,
-     * lists the FQNs of other production classes that depend on it.
+     * Expands a single BFS frontier: for each FQN in {@code currentLevel},
+     * looks up plausibly-referencing files via the text index, parses
+     * each, and confirms the reference resolves to the frontier FQN.
+     * Returns the set of consumer FQNs not already in {@code allVisited}.
+     *
+     * <p>Files reaching the parse step are deduplicated across the
+     * whole frontier (a file mentioning two different frontier FQNs
+     * parses once). For the index-backed code path the {@code
+     * ProjectIndex.compilationUnit} cache deduplicates further across
+     * BFS depths — the same file parses at most once per engine run.
      */
-    private Map<String, Set<String>> buildReverseDependencyMap(List<Path> sourceFiles,
-                                                               ProjectIndex index,
-                                                               Set<String> extraKnownFqns) {
-        Map<String, Set<String>> reverseMap = new HashMap<>();
-        JavaParser fallbackParser = (index == null) ? JavaParsers.newParser() : null;
+    private Set<String> expandFrontier(Set<String> currentLevel,
+                                       SimpleNameTextIndex textIndex,
+                                       Map<String, Path> fqnToFile,
+                                       Set<String> allKnownFqns,
+                                       Set<String> allVisited,
+                                       ProjectIndex index,
+                                       JavaParser fallbackParser) {
+        Set<String> nextLevel = new LinkedHashSet<>();
 
-        // First pass: collect all known FQNs so we can resolve simple names.
-        // `extraKnownFqns` is unioned in so reverse edges to deleted classes
-        // (which no longer have a source file on disk) still resolve — see
-        // the caller's comment for the full rationale.
-        Set<String> allKnownFqns = new HashSet<>();
-        for (Path file : sourceFiles) {
-            String fqn = pathToFqn(file);
-            if (fqn != null) {
-                allKnownFqns.add(fqn);
-            }
-        }
-        if (extraKnownFqns != null) {
-            allKnownFqns.addAll(extraKnownFqns);
+        // Group the frontier by simple name so we collect candidate
+        // files once per simple name even when multiple FQNs share it
+        // (cross-package collision, same shape as the #40 over-select).
+        Map<String, Set<String>> simpleNameToFrontierFqns = new LinkedHashMap<>();
+        for (String fqn : currentLevel) {
+            simpleNameToFrontierFqns
+                    .computeIfAbsent(SourceFileScanner.simpleClassName(fqn), k -> new LinkedHashSet<>())
+                    .add(fqn);
         }
 
-        // Second pass: for each source file, find field types and build reverse edges
-        for (Path file : sourceFiles) {
-            CompilationUnit cu = parseOrGet(file, index, fallbackParser);
-            if (cu == null) continue;
+        // Visit each candidate file at most once per frontier expansion.
+        // Multiple frontier FQNs can produce the same candidate (e.g.
+        // a file imports both A and B and both are in the frontier),
+        // and we still only need to parse once.
+        Set<Path> visitedCandidates = new HashSet<>();
 
-            String classFqn = pathToFqn(file);
-            if (classFqn == null) continue;
+        for (var entry : simpleNameToFrontierFqns.entrySet()) {
+            String simpleName = entry.getKey();
+            Set<String> targetFqnsForName = entry.getValue();
 
-            Map<String, String> importMap = new HashMap<>();
-            Set<String> wildcardPackages = new HashSet<>();
-            for (ImportDeclaration imp : cu.getImports()) {
-                if (imp.isAsterisk()) {
-                    wildcardPackages.add(imp.getNameAsString());
-                } else {
-                    String impFqn = imp.getNameAsString();
-                    importMap.put(SourceFileScanner.simpleClassName(impFqn), impFqn);
-                }
-            }
-
-            String currentPackage = cu.getPackageDeclaration()
-                    .map(pd -> pd.getNameAsString())
-                    .orElse("");
-
-            // Walk every ClassOrInterfaceType node in the compilation unit.
-            // This is deliberately broader than the old "fields + method
-            // signatures" scan it replaces:
-            //
-            //  * Generics: `List<Foo>` parses as ClassOrInterfaceType(List)
-            //    with a type-argument ClassOrInterfaceType(Foo). The old
-            //    code normalised the outer type name and threw the
-            //    argument away — any consumer that wrapped the changed
-            //    class in a container lost its reverse edge.
-            //  * Method bodies: local declarations (`PricingCalculator c
-            //    = new PricingCalculator()`), ObjectCreationExpr
-            //    (`new Foo()`), cast expressions, and `instanceof` checks
-            //    all show up as ClassOrInterfaceType nodes inside the
-            //    body subtree. The old code only looked at field types
-            //    and method signatures, so a helper class instantiated
-            //    inside a method body had no reverse edge and its
-            //    consumer's tests were silently dropped on changes.
-            //  * extends/implements: also surface as ClassOrInterfaceType,
-            //    giving us a correct supertype-aware reverse edge for
-            //    free.
-            Set<String> referencedTypes = new LinkedHashSet<>();
-            for (ClassOrInterfaceType t : cu.findAll(ClassOrInterfaceType.class)) {
-                String simpleName = t.getNameAsString();
-                if (!simpleName.isEmpty()) {
-                    referencedTypes.add(simpleName);
-                }
-            }
-
-            for (String typeName : referencedTypes) {
-                String resolvedFqn = importMap.get(typeName);
-                if (resolvedFqn == null) {
-                    String candidate = currentPackage.isEmpty()
-                            ? typeName : currentPackage + "." + typeName;
-                    if (allKnownFqns.contains(candidate)) {
-                        resolvedFqn = candidate;
-                    }
-                }
-                if (resolvedFqn == null) {
-                    for (String pkg : wildcardPackages) {
-                        String candidate = pkg + "." + typeName;
-                        if (allKnownFqns.contains(candidate)) {
-                            resolvedFqn = candidate;
-                            break;
-                        }
-                    }
+            for (Path candidate : textIndex.filesMentioning(simpleName)) {
+                if (!visitedCandidates.add(candidate)) {
+                    continue;
                 }
 
-                if (resolvedFqn != null && allKnownFqns.contains(resolvedFqn)
-                        && !resolvedFqn.equals(classFqn)) {
-                    reverseMap.computeIfAbsent(resolvedFqn, k -> new LinkedHashSet<>())
-                            .add(classFqn);
+                String candidateFqn = pathToFqn(candidate);
+                if (candidateFqn == null) continue;
+                if (allVisited.contains(candidateFqn)) continue;
+                // A file declares its own simple name; we don't want
+                // a self-edge (FooService.java mentions `FooService`
+                // because it declares it). The pre-#43 reverse-map
+                // construction also skipped self-edges via the
+                // explicit `!resolvedFqn.equals(classFqn)` check.
+                if (targetFqnsForName.contains(candidateFqn)) continue;
+
+                CompilationUnit cu = parseOrGet(candidate, index, fallbackParser);
+                if (cu == null) continue;
+
+                Set<String> resolvedTargets = resolveReferencesToFrontier(
+                        cu, simpleName, targetFqnsForName,
+                        candidateFqn, allKnownFqns);
+                if (!resolvedTargets.isEmpty()) {
+                    nextLevel.add(candidateFqn);
                 }
             }
         }
+        return nextLevel;
+    }
 
-        log.debug("[transitive] Built reverse dependency map with {} entries", reverseMap.size());
-        return reverseMap;
+    /**
+     * Inspects a candidate file's AST and returns the subset of
+     * {@code targetFqnsForName} that {@code candidate} actually
+     * references via {@code simpleName}. Walks {@link
+     * ClassOrInterfaceType} nodes (covers fields, method signatures,
+     * generics, method bodies, casts, {@code instanceof}, extends/
+     * implements) and resolves each via the candidate file's import
+     * map → wildcard imports → same-package fallback.
+     *
+     * <p>Returning the resolved set rather than a boolean lets the
+     * caller (and future diagnostics) tell which exact frontier FQN
+     * the candidate consumed. The frontier expansion only needs the
+     * non-empty / empty distinction today, but the richer return
+     * shape costs nothing and avoids pre-emptively narrowing the
+     * helper's contract.
+     */
+    private Set<String> resolveReferencesToFrontier(CompilationUnit cu,
+                                                    String simpleName,
+                                                    Set<String> targetFqnsForName,
+                                                    String candidateFqn,
+                                                    Set<String> allKnownFqns) {
+        Set<String> hits = new LinkedHashSet<>();
+
+        Map<String, String> importMap = new HashMap<>();
+        Set<String> wildcardPackages = new HashSet<>();
+        for (ImportDeclaration imp : cu.getImports()) {
+            if (imp.isAsterisk()) {
+                wildcardPackages.add(imp.getNameAsString());
+            } else {
+                String impFqn = imp.getNameAsString();
+                importMap.put(SourceFileScanner.simpleClassName(impFqn), impFqn);
+            }
+        }
+        String currentPackage = cu.getPackageDeclaration()
+                .map(pd -> pd.getNameAsString())
+                .orElse("");
+
+        for (ClassOrInterfaceType t : cu.findAll(ClassOrInterfaceType.class)) {
+            if (!simpleName.equals(t.getNameAsString())) {
+                continue;
+            }
+            String resolvedFqn = resolveSimpleName(
+                    simpleName, importMap, wildcardPackages,
+                    currentPackage, allKnownFqns);
+            if (resolvedFqn == null) continue;
+            if (resolvedFqn.equals(candidateFqn)) continue;
+            if (targetFqnsForName.contains(resolvedFqn)) {
+                hits.add(resolvedFqn);
+                // No early-return: we collect every frontier FQN this
+                // file resolves to, so the caller has full information.
+            }
+        }
+        return hits;
+    }
+
+    /**
+     * Same resolution ladder the pre-#43 reverse-map used: explicit
+     * imports → same-package candidate → wildcard packages. Returns
+     * {@code null} when the simple name does not resolve to any known
+     * FQN (the candidate must then be a stdlib type, a third-party
+     * type, or a typo — none of which produce reverse edges in the
+     * project graph).
+     */
+    private String resolveSimpleName(String simpleName,
+                                     Map<String, String> importMap,
+                                     Set<String> wildcardPackages,
+                                     String currentPackage,
+                                     Set<String> allKnownFqns) {
+        String explicit = importMap.get(simpleName);
+        if (explicit != null) return explicit;
+
+        if (!currentPackage.isEmpty()) {
+            String candidate = currentPackage + "." + simpleName;
+            if (allKnownFqns.contains(candidate)) return candidate;
+        } else {
+            // Default-package case — the simple name itself is the FQN.
+            if (allKnownFqns.contains(simpleName)) return simpleName;
+        }
+
+        for (String pkg : wildcardPackages) {
+            String candidate = pkg + "." + simpleName;
+            if (allKnownFqns.contains(candidate)) return candidate;
+        }
+        return null;
     }
 
     private CompilationUnit parseOrGet(Path file, ProjectIndex index, JavaParser fallbackParser) {
@@ -249,5 +387,69 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
 
     private String pathToFqn(Path file) {
         return SourceFileScanner.pathToFqn(file, config.sourceDirs());
+    }
+
+    /**
+     * Cheap text-derived "which files mention each simple type name"
+     * map. Built once per {@code walkTransitives} call from a single
+     * pass of file content (no AST construction, no JavaParser
+     * invocation). Tokenises each file's body for uppercase-leading
+     * identifiers — Java's type-name shape — and indexes them.
+     *
+     * <p>Over-matches by design: constants ({@code MAX_VALUE}), type
+     * variables ({@code T}), string-literal contents starting with
+     * uppercase, and other non-type uppercase tokens all land in the
+     * index. False positives only cause an extra {@code parseOrGet}
+     * which is bounded by the {@link ProjectIndex} CU cache, so a
+     * file parses at most once per engine run regardless of how many
+     * false-positive simple names match it. False <em>negatives</em>
+     * would silently drop reverse edges (a regression of the kind
+     * the {@code preservesGenericArgumentsInReverseDependencyEdges}
+     * and {@code discoversEdgesFromMethodBodyReferences} tests pin),
+     * so the regex is deliberately permissive on the over-match
+     * side.
+     *
+     * <p>Files that fail to read (I/O error, missing file due to
+     * concurrent {@code git rm}) are logged at debug and skipped —
+     * the same posture {@code JavaParsers.parseOrWarn} takes on
+     * malformed source. A skipped file simply doesn't contribute
+     * candidate edges; it does not crash the walk.
+     */
+    static final class SimpleNameTextIndex {
+        private final Map<String, Set<Path>> simpleNameToFiles;
+
+        private SimpleNameTextIndex(Map<String, Set<Path>> simpleNameToFiles) {
+            this.simpleNameToFiles = simpleNameToFiles;
+        }
+
+        static SimpleNameTextIndex build(List<Path> sourceFiles) {
+            Map<String, Set<Path>> map = new HashMap<>();
+            int filesScanned = 0;
+            int filesSkipped = 0;
+            for (Path file : sourceFiles) {
+                String content;
+                try {
+                    content = Files.readString(file);
+                } catch (IOException e) {
+                    log.debug("[transitive] Skipping unreadable source file {}: {}",
+                            file, e.getMessage());
+                    filesSkipped++;
+                    continue;
+                }
+                Matcher m = UPPERCASE_IDENT.matcher(content);
+                while (m.find()) {
+                    map.computeIfAbsent(m.group(), k -> new LinkedHashSet<>()).add(file);
+                }
+                filesScanned++;
+            }
+            log.debug("[transitive] Built simple-name text index from {} file(s) "
+                            + "({} skipped); {} distinct simple names indexed",
+                    filesScanned, filesSkipped, map.size());
+            return new SimpleNameTextIndex(map);
+        }
+
+        Set<Path> filesMentioning(String simpleName) {
+            return simpleNameToFiles.getOrDefault(simpleName, Set.of());
+        }
     }
 }
