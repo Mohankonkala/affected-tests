@@ -4,6 +4,15 @@ on:
   pull_request:
     branches: [master]
 
+# Pin the workflow's GITHUB_TOKEN to the minimum scope every step actually needs.
+# Without this block the workflow inherits whatever the org-level default is
+# (often `contents: write`), which is more than a `pull_request`-triggered build
+# job needs and is a real supply-chain surface — a malicious PR could submit a
+# workflow change in the same PR and gain whatever the default is.
+# See issue #50.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
