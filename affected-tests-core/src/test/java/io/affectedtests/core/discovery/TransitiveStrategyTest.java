@@ -211,6 +211,56 @@ class TransitiveStrategyTest {
     }
 
     @Test
+    void discoversTestsAtEveryDepthOfChainAfterUnionRefactor() throws IOException {
+        // Regression for #44: post-refactor, naming + usage run once on the
+        // union of every BFS depth's consumers rather than once per depth.
+        // Behaviour-preservation must hold across the entire chain, not just
+        // the leaf — a multi-depth chain where each depth has a distinct
+        // consumer test must still surface every test. Pre-#44 each depth
+        // ran naming/usage on its own slice and the results were unioned by
+        // `discoveredTests.addAll`, so the post-refactor union semantics
+        // need to produce the same outcome.
+        Path prodDir = tempDir.resolve("src/main/java/com/example");
+        Files.createDirectories(prodDir);
+        // Chain: A <- B <- C (B depends on A; C depends on B)
+        Files.writeString(prodDir.resolve("A.java"),
+                "package com.example;\npublic class A {}");
+        Files.writeString(prodDir.resolve("B.java"), """
+                package com.example;
+
+                public class B {
+                    private A a;
+                }
+                """);
+        Files.writeString(prodDir.resolve("C.java"), """
+                package com.example;
+
+                public class C {
+                    private B b;
+                }
+                """);
+
+        Path testDir = tempDir.resolve("src/test/java/com/example");
+        Files.createDirectories(testDir);
+        // BTest is at depth 1 from A (B is the depth-1 consumer of A).
+        // CTest is at depth 2 from A (C is the depth-2 consumer of A).
+        Files.writeString(testDir.resolve("BTest.java"),
+                "package com.example;\npublic class BTest {}");
+        Files.writeString(testDir.resolve("CTest.java"),
+                "package com.example;\npublic class CTest {}");
+
+        Set<String> result = strategy.discoverTests(
+                Set.of("com.example.A"), tempDir);
+
+        assertTrue(result.contains("com.example.BTest"),
+                "Depth-1 consumer's test must still surface — running naming "
+                        + "/ usage on the union must include depth 1's slice");
+        assertTrue(result.contains("com.example.CTest"),
+                "Depth-2 consumer's test must still surface — running naming "
+                        + "/ usage on the union must include depth 2's slice");
+    }
+
+    @Test
     void discoversConsumerTestsForDeletedProductionClass() throws IOException {
         // The fixture mirrors a `git rm FooService.java` MR: FooService is in
         // the changed set (surfaced by GitChangeDetector via the old path)

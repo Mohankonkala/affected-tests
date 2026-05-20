@@ -81,6 +81,17 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
         Map<String, Set<String>> dependencyMap =
                 buildReverseDependencyMap(sourceFiles, index, changedProductionClasses);
 
+        // Collect the union of every depth's consumers BEFORE running naming
+        // / usage. Pre-this-change, naming + usage ran once per depth on each
+        // depth's `nextLevel` set, so a default `transitiveDepth = 4` walk
+        // re-scanned every test file four times. Both strategies are pure
+        // functions of their input class set — naming.discover(A) ∪
+        // naming.discover(B) ≡ naming.discover(A ∪ B), and the same holds
+        // for usage — so deferring the strategy invocation to the end of
+        // the BFS and running it once on the union is behaviour-preserving
+        // and removes (depth − 1) full passes through the test corpus.
+        Set<String> transitiveConsumers = new LinkedHashSet<>();
+
         for (int depth = 1; depth <= config.transitiveDepth(); depth++) {
             Set<String> nextLevel = new LinkedHashSet<>();
 
@@ -101,19 +112,24 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
 
             log.debug("[transitive] Depth {}: found {} downstream types", depth, nextLevel.size());
 
-            if (index != null) {
-                discoveredTests.addAll(namingStrategy.discoverTests(nextLevel, index));
-                discoveredTests.addAll(usageStrategy.discoverTests(nextLevel, index));
-            } else {
-                discoveredTests.addAll(namingStrategy.discoverTests(nextLevel, projectDir));
-                discoveredTests.addAll(usageStrategy.discoverTests(nextLevel, projectDir));
-            }
-
+            transitiveConsumers.addAll(nextLevel);
             currentLevel = nextLevel;
         }
 
-        log.info("[transitive] Discovered {} tests via transitive dependencies (depth={})",
-                discoveredTests.size(), config.transitiveDepth());
+        // One pass through all test files for naming, one for usage, against
+        // the union of every depth's consumers.
+        if (!transitiveConsumers.isEmpty()) {
+            if (index != null) {
+                discoveredTests.addAll(namingStrategy.discoverTests(transitiveConsumers, index));
+                discoveredTests.addAll(usageStrategy.discoverTests(transitiveConsumers, index));
+            } else {
+                discoveredTests.addAll(namingStrategy.discoverTests(transitiveConsumers, projectDir));
+                discoveredTests.addAll(usageStrategy.discoverTests(transitiveConsumers, projectDir));
+            }
+        }
+
+        log.info("[transitive] Discovered {} tests across {} transitive consumer(s) (max depth={})",
+                discoveredTests.size(), transitiveConsumers.size(), config.transitiveDepth());
         return discoveredTests;
     }
 
