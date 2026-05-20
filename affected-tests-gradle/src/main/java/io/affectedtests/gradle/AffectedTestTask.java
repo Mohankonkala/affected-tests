@@ -293,6 +293,28 @@ public abstract class AffectedTestTask extends DefaultTask {
     public abstract Property<Boolean> getExplain();
 
     /**
+     * Format for the {@code --explain} trace. {@code "text"} (the
+     * default) produces the human-readable line-oriented trace every
+     * adopter has been consuming since v2; {@code "json"} produces
+     * a compact single-line JSON object with the same fields, suitable
+     * for dashboard / telemetry pipelines that previously had to
+     * regex-parse the text trace and broke every time the trace
+     * shape evolved (issue #53).
+     *
+     * <p>{@link Internal @Internal} for the same reason as
+     * {@link #getExplain}: format selection only changes lifecycle
+     * logging, never the set of tests Gradle would run.
+     *
+     * @return the explain format property
+     */
+    @Internal
+    @Option(option = "explain-format",
+            description = "Output format for --explain. One of: 'text' (default, "
+                    + "human-readable) or 'json' (compact JSON object for dashboards "
+                    + "and telemetry).")
+    public abstract Property<String> getExplainFormat();
+
+    /**
      * Map of subproject directory (relative to the root project, empty string
      * for the root project itself) to the Gradle path of that subproject
      * (e.g. {@code ":services:payment"}). Populated automatically by the plugin
@@ -379,8 +401,21 @@ public abstract class AffectedTestTask extends DefaultTask {
                 }
                 moduleGroupsForExplain = taskKeyed;
             }
-            for (String line : renderExplainTrace(config, result, moduleGroupsForExplain)) {
-                getLogger().lifecycle(line);
+            String format = resolveExplainFormat(getExplainFormat().getOrNull());
+            if ("json".equals(format)) {
+                // Single line so dashboards / telemetry pipelines can
+                // tail-grep the lifecycle stream and feed each line
+                // directly to a JSON parser without multi-line
+                // assembly. Routed through lifecycle() so it shows up
+                // in the same default-visible stream the text trace
+                // uses — operators don't have to flip --info to see
+                // it.
+                getLogger().lifecycle(
+                        renderExplainJson(config, result, moduleGroupsForExplain));
+            } else {
+                for (String line : renderExplainTrace(config, result, moduleGroupsForExplain)) {
+                    getLogger().lifecycle(line);
+                }
             }
             return;
         }
@@ -1766,5 +1801,265 @@ public abstract class AffectedTestTask extends DefaultTask {
                             + "the engine only produces that situation on a non-empty "
                             + "selection, which is never skipped");
         };
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // --explain JSON output (issue #53)
+    // ─────────────────────────────────────────────────────────────────
+
+    /** Schema version for {@link #renderExplainJson}. Bump on breaking changes. */
+    static final int EXPLAIN_JSON_SCHEMA_VERSION = 1;
+
+    /**
+     * Resolves and validates the {@code --explain-format} argument.
+     * Empty / null defaults to {@code "text"} for backwards
+     * compatibility with every adopter who has been consuming the
+     * line-oriented trace since v2. Anything other than
+     * {@code "text"} or {@code "json"} fails the build at the
+     * {@code @TaskAction} entry point — we want a typo to surface
+     * the typo, not silently fall back to text and have the operator
+     * wonder why their dashboard pipeline never receives JSON.
+     *
+     * <p>Package-private so {@code AffectedTestTaskExplainJsonFormatTest}
+     * can pin both the default-resolution and the validation paths
+     * without spinning up a Gradle test runtime.
+     */
+    static String resolveExplainFormat(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return "text";
+        }
+        String normalised = raw.trim().toLowerCase(Locale.ROOT);
+        if (!normalised.equals("text") && !normalised.equals("json")) {
+            throw new GradleException(
+                    "Unsupported --explain-format='" + raw + "'. "
+                            + "Supported values: 'text' (default) or 'json'.");
+        }
+        return normalised;
+    }
+
+    /**
+     * Renders the same decision trace as {@link #renderExplainTrace} but
+     * as a single-line, compact JSON object suitable for direct
+     * consumption by dashboards / telemetry pipelines. Schema version
+     * is carried in the {@code "version"} field so consumers can
+     * detect future additions; new fields will be added additively
+     * within {@link #EXPLAIN_JSON_SCHEMA_VERSION} as long as no
+     * existing field's name or type changes.
+     *
+     * <p>The renderer is a pure function of {@link AffectedTestsConfig},
+     * {@link AffectedTestsResult}, and the per-module breakdown — no
+     * Gradle services, no I/O — so the unit tests exercise it directly
+     * without spinning up a build runtime, mirroring the text-trace
+     * unit-test ergonomics. Bucket samples are capped at
+     * {@link #EXPLAIN_SAMPLE_LIMIT} (matching the text trace) so the
+     * payload size stays bounded for very large diffs; consumers
+     * that need full bucket contents can compare the per-bucket count
+     * field against the per-bucket sample array length to detect
+     * truncation.
+     *
+     * <p><b>Why a hand-rolled serialiser:</b> the plugin deliberately
+     * has no Jackson / Gson dependency (keeps the published artifact
+     * small and avoids version conflicts with adopter projects). The
+     * schema is small, fixed, and string-keyed so a focussed escaper
+     * + concatenation is enough; adding a JSON library for one
+     * 50-line method would be a poor trade.
+     */
+    static String renderExplainJson(AffectedTestsConfig config,
+                                    AffectedTestsResult result,
+                                    Map<String, List<String>> moduleGroups) {
+        StringBuilder json = new StringBuilder(512);
+        json.append('{');
+        appendJsonField(json, "version", EXPLAIN_JSON_SCHEMA_VERSION); json.append(',');
+        appendJsonField(json, "baseRef", config.baseRef()); json.append(',');
+
+        json.append("\"mode\":{");
+        appendJsonField(json, "configured", config.mode().name()); json.append(',');
+        appendJsonField(json, "effective", config.effectiveMode().name());
+        json.append("},");
+
+        appendJsonField(json, "changedFiles", result.changedFiles().size()); json.append(',');
+
+        Buckets buckets = result.buckets();
+        json.append("\"buckets\":{");
+        appendJsonField(json, "ignored", buckets.ignoredFiles().size()); json.append(',');
+        appendJsonField(json, "outOfScope", buckets.outOfScopeFiles().size()); json.append(',');
+        appendJsonField(json, "production", buckets.productionFiles().size()); json.append(',');
+        appendJsonField(json, "test", buckets.testFiles().size()); json.append(',');
+        appendJsonField(json, "unmapped", buckets.unmappedFiles().size());
+        json.append("},");
+
+        // Bucket samples mirror the text-trace cap — same truncation
+        // posture, same EXPLAIN_SAMPLE_LIMIT applied. Skip empty
+        // buckets entirely so the payload doesn't bloat with five
+        // empty arrays on a typical clean diff.
+        json.append("\"samples\":{");
+        boolean firstSample = true;
+        firstSample = appendBucketSampleField(json, firstSample, "ignored", buckets.ignoredFiles());
+        firstSample = appendBucketSampleField(json, firstSample, "outOfScope", buckets.outOfScopeFiles());
+        firstSample = appendBucketSampleField(json, firstSample, "production", buckets.productionFiles());
+        firstSample = appendBucketSampleField(json, firstSample, "test", buckets.testFiles());
+        appendBucketSampleField(json, firstSample, "unmapped", buckets.unmappedFiles());
+        json.append("},");
+
+        appendJsonField(json, "situation", result.situation().name()); json.append(',');
+
+        json.append("\"action\":{");
+        appendJsonField(json, "name", result.action().name()); json.append(',');
+        appendJsonField(json, "source", config.actionSourceFor(result.situation()).name());
+        json.append("},");
+
+        // Outcome shape mirrors the text trace's "Outcome:" line but
+        // exposes the components separately so consumers don't have
+        // to string-parse "FULL_SUITE — non-Java change in diff" back
+        // into kind + reason. The kind is one of FULL_SUITE / SKIPPED
+        // / SELECTED; selectedClassCount is only meaningful on
+        // SELECTED but is always present (0 elsewhere) so the schema
+        // is total — consumers don't need to branch on optional
+        // fields.
+        json.append("\"outcome\":{");
+        String outcomeKind;
+        if (result.runAll()) {
+            outcomeKind = "FULL_SUITE";
+        } else if (result.skipped()) {
+            outcomeKind = "SKIPPED";
+        } else if (result.action() == Action.SELECTED) {
+            outcomeKind = "SELECTED";
+        } else {
+            outcomeKind = result.action().name();
+        }
+        appendJsonField(json, "kind", outcomeKind); json.append(',');
+        appendJsonField(json, "selectedClassCount", result.testClassFqns().size()); json.append(',');
+        appendJsonField(json, "escalationReason", result.escalationReason().name());
+        json.append("},");
+
+        // Modules block: only populated on SELECTED runs (the text
+        // renderer has the same conditional). Keep the array always
+        // present (empty when there's no selection) so consumers can
+        // iterate without null-checking.
+        json.append("\"modules\":[");
+        boolean firstModule = true;
+        if (moduleGroups != null) {
+            for (Map.Entry<String, List<String>> entry : moduleGroups.entrySet()) {
+                if (!firstModule) json.append(',');
+                firstModule = false;
+                json.append('{');
+                appendJsonField(json, "task", entry.getKey()); json.append(',');
+                appendJsonField(json, "fqns", entry.getValue());
+                json.append('}');
+            }
+        }
+        json.append("],");
+
+        // The action matrix is cheap to serialise (5 entries) and
+        // invaluable for "why did my explicit setting not win"
+        // dashboards. Same shape as the text trace's "Action matrix"
+        // block: situation -> {action, source}.
+        json.append("\"actionMatrix\":{");
+        boolean firstMatrix = true;
+        for (Situation s : situationOrder()) {
+            if (!firstMatrix) json.append(',');
+            firstMatrix = false;
+            json.append('"').append(jsonEscape(s.name())).append("\":{");
+            appendJsonField(json, "action", config.actionFor(s).name()); json.append(',');
+            appendJsonField(json, "source", config.actionSourceFor(s).name());
+            json.append('}');
+        }
+        json.append('}');
+
+        json.append('}');
+        return json.toString();
+    }
+
+    /**
+     * Renders one entry of the bucket-samples block. Empty buckets
+     * are skipped entirely so the payload stays compact on the
+     * common clean-diff case where most buckets are empty. Returns
+     * the updated {@code first} flag so the caller knows whether to
+     * emit a leading comma on the next field.
+     */
+    private static boolean appendBucketSampleField(StringBuilder json, boolean first,
+                                                   String key, Set<String> files) {
+        if (files.isEmpty()) {
+            return first;
+        }
+        if (!first) json.append(',');
+        List<String> capped = files.stream()
+                .sorted()
+                .limit(EXPLAIN_SAMPLE_LIMIT)
+                .map(LogSanitizer::sanitize)
+                .toList();
+        appendJsonField(json, key, capped);
+        return false;
+    }
+
+    private static void appendJsonField(StringBuilder json, String key, String value) {
+        json.append('"').append(jsonEscape(key)).append("\":");
+        if (value == null) {
+            json.append("null");
+        } else {
+            json.append('"').append(jsonEscape(value)).append('"');
+        }
+    }
+
+    private static void appendJsonField(StringBuilder json, String key, int value) {
+        json.append('"').append(jsonEscape(key)).append("\":").append(value);
+    }
+
+    private static void appendJsonField(StringBuilder json, String key, List<String> values) {
+        json.append('"').append(jsonEscape(key)).append("\":[");
+        boolean first = true;
+        for (String v : values) {
+            if (!first) json.append(',');
+            first = false;
+            json.append('"').append(jsonEscape(v == null ? "" : v)).append('"');
+        }
+        json.append(']');
+    }
+
+    /**
+     * RFC 8259 string escaper. Escapes the six required control
+     * characters ({@code \b \f \n \r \t \"} / {@code \\}) and emits
+     * any other character below 0x20 as a {@code \\u}NNNN sequence.
+     * Forward slash and the non-mandatory unicode separators are
+     * passed through — RFC 8259 only requires escaping where the
+     * unescaped form would terminate the string or break the JSON
+     * grammar.
+     *
+     * <p>The input strings on the merge gate are attacker-influenced
+     * (filenames from the diff, FQNs derived from those filenames),
+     * so this method must be defensively comprehensive. A bare
+     * unsanitised newline in a sample path would terminate the JSON
+     * line and let an attacker inject a forged trace into a
+     * dashboard pipeline.
+     */
+    static String jsonEscape(String s) {
+        StringBuilder out = new StringBuilder(s.length() + 8);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\b' -> out.append("\\b");
+                case '\f' -> out.append("\\f");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (c < 0x20) {
+                        // Split the "\\u" prefix from the format
+                        // specifier so javac does not read the
+                        // following four characters as a unicode
+                        // escape sequence (Java unicode escapes
+                        // are processed in the source-text phase
+                        // before lexing, even inside comments).
+                        out.append("\\u")
+                                .append(String.format(Locale.ROOT, "%04x", (int) c));
+                    } else {
+                        out.append(c);
+                    }
+                }
+            }
+        }
+        return out.toString();
     }
 }
