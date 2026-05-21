@@ -104,13 +104,17 @@ gradlePlugin {
             description = 'Detects changes in the current branch and runs only the tests relevant to those changes. Zero config, CI-friendly, multi-module support.'
             tags.set(['testing', 'affected-tests', 'ci', 'git', 'junit', 'test-selection'])
 
-            // plugin-publish 2.1.x deprecates omitting this declaration and will
-            // eventually reject plugins that don't supply one. Declared as
-            // `false` today because AffectedTestTask is not yet CC-safe; flip
-            // to `true` once the task is made cacheable.
+            // plugin-publish 2.1.x deprecates omitting this declaration and
+            // will eventually reject plugins that don't supply one. Declared
+            // as `true` because AffectedTestTask only captures Gradle
+            // Property / ListProperty / MapProperty / DirectoryProperty
+            // values and reads its execution services via @Inject — see
+            // AffectedTestTask's class Javadoc for the full posture, and
+            // the `--configuration-cache --configuration-cache-problems=fail`
+            // scenario in feature 07 for the regression that pins it.
             compatibility(it) {
                 features {
-                    configurationCache = false
+                    configurationCache = true
                 }
             }
         }

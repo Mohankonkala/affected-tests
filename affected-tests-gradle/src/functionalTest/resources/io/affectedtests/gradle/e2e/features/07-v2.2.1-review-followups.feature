@@ -21,12 +21,28 @@ Feature: v2.2.1 — code-review follow-ups from the v2.2 ship
   # `--configuration-cache` run on the same SELECTED shape adopters
   # use daily: if the Callable ever regresses to capturing Project
   # again, this scenario turns red.
+  #
+  # Post-#46 follow-through: removed the task-side
+  # `notCompatibleWithConfigurationCache(...)` opt-out and flipped
+  # the plugin-publish `compatibility(...) configurationCache` from
+  # `false` to `true`, so this scenario now also pins the *strong*
+  # claim that the task is end-to-end CC-clean. The flag
+  # `--configuration-cache-problems=fail` is what turns a
+  # silently-degraded CC run into a hard failure.
   # ------------------------------------------------------------------
   Scenario: --configuration-cache stores and reuses the task graph without Project capture
     Given a production class "com.example.FooService" with its matching test "com.example.FooServiceTest"
     And the baseline commit is captured
     And the diff modifies "src/main/java/com/example/FooService.java"
     And the Gradle command-line argument "--configuration-cache"
+    # Post-#46: turn any CC violation into a hard failure rather than
+    # a soft degradation. With the task no longer self-marked
+    # incompatible, the only way this scenario stays green is for
+    # every captured value (Properties, Providers, ExecOperations
+    # service) to actually serialise round-trip. A regression
+    # introducing a Project / Task / Build capture surfaces here as
+    # an error before we reach any `output contains` assertion below.
+    And the Gradle command-line argument "--configuration-cache-problems=fail"
     When the affected-tests task runs with "--explain"
     Then the task succeeds
     # Gradle logs the CC-store event on the first run — no store line

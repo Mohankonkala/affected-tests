@@ -49,16 +49,26 @@ import java.util.stream.Collectors;
  *       once per module so that {@code --tests} filters don't cross module boundaries</li>
  * </ol>
  *
- * <p>Not compatible with Configuration Cache: reads live git state and scans
- * the file system at execution time. The task is also deliberately marked as
- * never up-to-date so git changes always trigger a re-run.
+ * <p>Configuration-cache safe: every input is a Gradle {@code Property} /
+ * {@code ListProperty} / {@code MapProperty} / {@code DirectoryProperty},
+ * the dispatch path runs through an injected {@link ExecOperations}
+ * service, and no {@code Project} or live build-time object is captured
+ * by the task action. Reading the live git state and walking the source
+ * tree happen entirely inside {@link #runAffectedTests()} — that's
+ * task-action work, which CC stores once and replays on subsequent
+ * runs without re-resolving the task graph.
+ *
+ * <p>The task is deliberately marked as never up-to-date
+ * ({@code outputs.upToDateWhen(t -> false)}) so a real git change always
+ * triggers a re-run; that's an up-to-date concern, independent of CC.
  */
 public abstract class AffectedTestTask extends DefaultTask {
 
     public AffectedTestTask() {
-        notCompatibleWithConfigurationCache("Reads live git state and scans the file system at execution time");
-        // The task has no declared outputs and its result depends on live git state,
-        // so up-to-date checks must always miss.
+        // No declared outputs and the result depends on live git state,
+        // so up-to-date checks must always miss. CC compatibility is a
+        // separate concern (the task IS CC-safe — see the class Javadoc)
+        // so we no longer self-mark with notCompatibleWithConfigurationCache.
         getOutputs().upToDateWhen(t -> false);
     }
 
