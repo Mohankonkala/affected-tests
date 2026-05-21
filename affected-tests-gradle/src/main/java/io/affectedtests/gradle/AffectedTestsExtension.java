@@ -113,6 +113,26 @@ public abstract class AffectedTestsExtension {
     public abstract ListProperty<String> getTestDirs();
 
     /**
+     * Names of the Gradle test tasks the dispatch path may invoke
+     * (one nested {@code ./gradlew} call per {@code module × taskName}
+     * pair). Default: {@code ["test"]}.
+     *
+     * <p>Adopters with extra source sets opt them in here:
+     * {@code testTaskNames = ["test", "integrationTest"]}. The
+     * dispatch path routes each discovered FQN to the task whose
+     * source-set directory the FQN's file sits under, by the
+     * standard Gradle convention {@code src/<taskName>/java}. When
+     * setting this knob, callers typically also extend
+     * {@link #getTestDirs()} to include the corresponding source-set
+     * directories so the discovery passes scan them — otherwise the
+     * extra source sets stay invisible to discovery and the new
+     * task name has nothing to dispatch.
+     *
+     * @return the test task names list property
+     */
+    public abstract ListProperty<String> getTestTaskNames();
+
+    /**
      * Glob patterns for files that must never influence test selection —
      * for purely documentation, build metadata, or generated artifacts.
      * A diff consisting entirely of ignored paths routes through
