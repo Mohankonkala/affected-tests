@@ -466,6 +466,75 @@ class UsageStrategyTest {
     }
 
     @Test
+    void findsTestThatReferencesChangedClassOnlyInsideNestedGeneric() throws IOException {
+        // Regression for the AST-walk consolidation in #39. The post-#39
+        // matcher does a single `findAll(ClassOrInterfaceType)` walk and
+        // checks `type.getNameAsString()` against changed-class simple
+        // names, instead of regex-scanning the type strings of fields /
+        // params / methods / object creations. The cheapest scenario where
+        // those two shapes diverge is a same-package reference to the
+        // changed class only inside a nested generic position
+        // (`Map<String, List<Foo>>`). JavaParser's recursive
+        // findAll surfaces every nested ClassOrInterfaceType node, so
+        // the inner `Foo` is picked up by name even though no field /
+        // param / method / object-creation type *equals* "Foo" — its
+        // type string is `Map<String, List<Foo>>`. Pre-#39 this happened
+        // to work via the regex fallback in `typeMatches`; locking it
+        // in keeps that behaviour from silently regressing if the AST
+        // shape changes in a future JavaParser bump.
+        Path testDir = tempDir.resolve("src/test/java/com/example/service");
+        Files.createDirectories(testDir);
+        Files.writeString(testDir.resolve("NestedGenericTest.java"), """
+                package com.example.service;
+
+                import java.util.List;
+                import java.util.Map;
+
+                public class NestedGenericTest {
+                    private Map<String, List<BarModel>> byKey;
+                }
+                """);
+
+        Set<String> result = strategy.discoverTests(
+                Set.of("com.example.service.BarModel"), tempDir);
+
+        assertTrue(result.contains("com.example.service.NestedGenericTest"),
+                "Same-package reference to a changed class inside a nested "
+                        + "generic position must still match — the consolidated "
+                        + "AST walk must descend into generic type arguments");
+    }
+
+    @Test
+    void doesNotMatchWhenSimpleNameOnlyAppearsAsUnrelatedIdentifier() throws IOException {
+        // The pre-#39 regex-on-type-string approach used a word-boundary
+        // pattern (`(?<![\w])Name(?![\w])`) so `Id` wouldn't match
+        // `GridLayout`. The post-#39 walk uses
+        // `ClassOrInterfaceType.getNameAsString()` which returns the
+        // tokenised simple name directly from the AST — so the same
+        // false-positive is structurally impossible. Lock the behaviour
+        // in: a test that mentions `BarModel` only inside a longer
+        // class name (`BarModelException`) must not match a change to
+        // `BarModel`.
+        Path testDir = tempDir.resolve("src/test/java/com/example/service");
+        Files.createDirectories(testDir);
+        Files.writeString(testDir.resolve("PrefixTest.java"), """
+                package com.example.service;
+
+                public class PrefixTest {
+                    private BarModelException ex;
+                }
+                """);
+
+        Set<String> result = strategy.discoverTests(
+                Set.of("com.example.service.BarModel"), tempDir);
+
+        assertTrue(result.isEmpty(),
+                "A class named BarModelException must not match a change to "
+                        + "BarModel — the simple-name compare uses the parsed "
+                        + "AST identifier, not a substring scan");
+    }
+
+    @Test
     void findsTestThatUsesStaticWildcardImportFromChangedClass() throws IOException {
         // Same as above but with the wildcard static form:
         // `import static com.example.Constants.*;`. Pre-fix this was
