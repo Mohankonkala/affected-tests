@@ -11,6 +11,7 @@ import io.affectedtests.core.util.LogSanitizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 
@@ -282,12 +283,36 @@ public final class AffectedTestsEngine {
         candidateTests.addAll(mapping.testClasses());
         log.info("Directly changed test classes: {}", mapping.testClasses().size());
 
+        Set<String> productionClasses = mapping.productionClasses();
+
+        // Fast path for test-only diffs: if the diff has zero production
+        // classes, every discovery strategy would early-return empty (each
+        // strategy's first check is `if (changedProductionClasses.isEmpty())
+        // return Set.of()`), so the only candidate tests are the
+        // directly-changed ones in `mapping.testClasses()`. Building the
+        // ProjectIndex would then walk every source dir, every test dir,
+        // and every test FQN-resolution candidate without ever consulting
+        // any of the resulting maps — pure waste. Two costs the fast path
+        // avoids on a 10k-class harness:
+        //
+        //   * SourceFileScanner.collectSourceFiles + collectTestFiles
+        //     (two full file-tree walks of source/test dirs).
+        //   * SourceFileScanner.scanTestFqnsWithFiles + the per-source-dir
+        //     fqnsUnder loop (a third + fourth walk to build the FQN
+        //     dispatch map and the source-FQN disambiguation set).
+        //
+        // The on-disk filter that the index normally provides is
+        // recreated here directly via Files.exists on the diff's own
+        // changedTestFiles paths — bounded by the diff size, not the
+        // workspace size.
+        if (productionClasses.isEmpty()) {
+            return runTestOnlyFastPath(changedFiles, mapping, buckets, candidateTests);
+        }
+
         NamingConventionStrategy namingStrategy = new NamingConventionStrategy(config);
         UsageStrategy usageStrategy = new UsageStrategy(config);
         ImplementationStrategy implStrategy = new ImplementationStrategy(config, namingStrategy, usageStrategy);
         TransitiveStrategy transitiveStrategy = new TransitiveStrategy(config, namingStrategy, usageStrategy);
-
-        Set<String> productionClasses = mapping.productionClasses();
 
         ProjectIndex index = ProjectIndex.build(projectDir, config);
 
@@ -394,6 +419,100 @@ public final class AffectedTestsEngine {
                 false,
                 false,
                 finalSituation,
+                Action.SELECTED,
+                EscalationReason.NONE
+        );
+    }
+
+    /**
+     * Test-only diff fast path: every discovery strategy would early-return
+     * on an empty production-class set, so the only candidates are the
+     * directly-changed tests in {@code mapping.testClasses()}. We still
+     * have to filter out FQNs whose source file is gone (a deleted test
+     * class FQN must not reach Gradle's {@code --tests} flag, or the
+     * outer build fails with "No tests found"), but that filter only
+     * needs to look at the diff's own {@link MappingResult#changedTestFiles()}
+     * entries — not at the entire workspace.
+     *
+     * <p>Iterates the relative paths from the mapping result, derives each
+     * one's FQN via {@link SourceFileScanner#pathToFqn(Path, List)} (the
+     * same string-only logic the diff-time mapper uses, no file I/O), and
+     * keeps only the entries whose absolute path resolves to a file that
+     * still exists on disk. Returns the same {@link AffectedTestsResult}
+     * shape the strategy-driven code path returns, with
+     * {@link Situation#DISCOVERY_SUCCESS} when at least one test survives
+     * the filter and {@link Situation#DISCOVERY_EMPTY} otherwise.
+     */
+    private AffectedTestsResult runTestOnlyFastPath(Set<String> changedFiles,
+                                                    MappingResult mapping,
+                                                    Buckets buckets,
+                                                    Set<String> candidateTests) {
+        log.info("[fast-path] Test-only diff: skipping ProjectIndex build (no production classes in diff)");
+
+        Set<String> survivingTests = new LinkedHashSet<>();
+        Map<String, Path> fqnToPath = new LinkedHashMap<>();
+        for (String relativeTestPath : mapping.changedTestFiles()) {
+            Path absolute = projectDir.resolve(relativeTestPath).toAbsolutePath();
+            if (!Files.exists(absolute)) {
+                // Deleted test in the diff — its FQN is in
+                // mapping.testClasses() but the file is gone. Drop it
+                // for the same reason the index-based filter does:
+                // Gradle's --tests flag would fail the outer build with
+                // "No tests found for given includes".
+                log.debug("[fast-path] Skipping deleted test file: {}",
+                        LogSanitizer.sanitize(relativeTestPath));
+                continue;
+            }
+            String fqn = SourceFileScanner.pathToFqn(absolute, config.testDirs());
+            if (fqn == null) {
+                // Defensive: every entry in changedTestFiles was placed
+                // there because tryMapToClass derived an FQN from its
+                // relative path, so re-derivation against the absolute
+                // form should always succeed. Treat a null here as an
+                // implementation drift between the two derivers and
+                // log at debug — there's no operator-actionable signal
+                // since the file existed.
+                log.debug("[fast-path] Test path on disk but FQN un-derivable, skipping: {}",
+                        LogSanitizer.sanitize(relativeTestPath));
+                continue;
+            }
+            if (!candidateTests.contains(fqn)) {
+                // Defensive: same reasoning as above. The candidate set
+                // was seeded from mapping.testClasses() in lock-step with
+                // mapping.changedTestFiles(), so the two should always
+                // agree on FQNs.
+                continue;
+            }
+            survivingTests.add(fqn);
+            fqnToPath.put(fqn, absolute);
+        }
+
+        if (survivingTests.isEmpty()) {
+            // Either the diff had only deleted test files, or the FQN
+            // re-derivation produced no matches (defensive branch). Same
+            // outcome either way: route through DISCOVERY_EMPTY so the
+            // configured action picks the policy.
+            Action action = config.actionFor(Situation.DISCOVERY_EMPTY);
+            log.info("[fast-path] No surviving test classes after on-disk filter. "
+                    + "Situation: {}, Action: {}.", Situation.DISCOVERY_EMPTY, action);
+            return emptyResult(Situation.DISCOVERY_EMPTY, action, changedFiles,
+                    mapping.productionClasses(), mapping.testClasses(), buckets);
+        }
+
+        log.info("=== Result: {} affected test classes ({}) — fast path ===",
+                survivingTests.size(), Situation.DISCOVERY_SUCCESS);
+        survivingTests.forEach(t -> log.info("  -> {}", LogSanitizer.sanitize(t)));
+
+        return new AffectedTestsResult(
+                survivingTests,
+                Collections.unmodifiableMap(fqnToPath),
+                changedFiles,
+                mapping.productionClasses(),
+                mapping.testClasses(),
+                buckets,
+                false,
+                false,
+                Situation.DISCOVERY_SUCCESS,
                 Action.SELECTED,
                 EscalationReason.NONE
         );
