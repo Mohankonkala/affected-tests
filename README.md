@@ -422,6 +422,10 @@ Internally, each discovered test FQN is traced back to the Gradle subproject tha
 
 This makes `--tests` filters scope cleanly to their owning module, instead of being applied globally and failing on any subproject that doesn't happen to contain the FQN. Cross-module imports (e.g. a test in `application` that imports a class from `api`) are still detected correctly via the `usage` and `impl` strategies.
 
+### Coverage tools (JaCoCo, Sonar, Cobertura, …)
+
+Coverage tools work transparently: `affectedTest` invokes each module's standard `test` task, so any agent or report wired to `test` — JaCoCo's agent, `jacocoTestReport`, the `org.sonarqube` plugin, `jacoco-report-aggregation`, etc. — attaches to the run unchanged, and coverage on changed lines reflects the tests the plugin selected (which is what new-code coverage gates require). Project-wide coverage drops on an MR pipeline are expected because untouched tests don't run; configure your gate against new code (Sonar's default) rather than overall coverage when running `affectedTest` instead of `test`.
+
 ## Behaviour reference
 
 Every row below shows the situation the engine resolved, and the action applied with the default configuration (no `mode` set, no explicit `onXxx`).
