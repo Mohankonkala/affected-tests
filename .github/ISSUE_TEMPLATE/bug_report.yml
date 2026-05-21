@@ -1,0 +1,98 @@
+name: Bug report
+description: The plugin did something it should not have, or did not do something it should have.
+title: "bug: <one-line summary>"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. The single most useful thing you can include is the output of `./gradlew affectedTest --explain` — it tells us the diff bucketing, situation, action, and source of the action without you having to summarise it. The form below asks for the rest.
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: From `./gradlew :buildEnvironment` or the `version` line in your `build.gradle` plugins block.
+      placeholder: "2.2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: gradle-version
+    attributes:
+      label: Gradle version
+      description: From `./gradlew --version`.
+      placeholder: "9.3.1"
+    validations:
+      required: true
+
+  - type: input
+    id: java-version
+    attributes:
+      label: Java version
+      description: From `java -version` (the JVM Gradle is using, not necessarily JAVA_HOME).
+      placeholder: "Temurin 21.0.5"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ci-or-local
+    attributes:
+      label: Where did this happen?
+      options:
+        - Local developer build
+        - GitHub Actions
+        - GitLab CI
+        - Jenkins
+        - Other CI
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: |
+        What did the plugin do, and what did you expect it to do? Be specific about the gap — "ran the full suite" vs "skipped" vs "selected the wrong tests" are very different bugs.
+      placeholder: "Expected: 3 tests selected. Got: full suite."
+    validations:
+      required: true
+
+  - type: textarea
+    id: explain-output
+    attributes:
+      label: --explain output
+      description: |
+        Paste the full output of `./gradlew affectedTest --explain` against the failing diff. Trim secrets, but please keep the bucket counts, situation, action, and action matrix intact — those are what we triage from.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: diff-shape
+    attributes:
+      label: What does the diff look like?
+      description: |
+        `git diff --name-only <base-ref>` is enough. Paths matter more than contents — bucket assignment is path-based.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: config
+    attributes:
+      label: affectedTests block from build.gradle
+      description: |
+        The `affectedTests { ... }` block from your `build.gradle`, plus anything relevant from gradle.properties (`affectedTests.*`, `org.gradle.configuration-cache`).
+      render: groovy
+    validations:
+      required: false
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround you found
+      description: Optional — but it's a useful triage signal.
+      placeholder: "Disabled the plugin via AFFECTED_TESTS_ENABLED=false on this PR."
+    validations:
+      required: false

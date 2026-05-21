@@ -1,0 +1,12 @@
+# Disable the "Open a blank issue" link so every report lands in
+# one of the structured templates below. Adopters can still file
+# security reports via GitHub's private vulnerability reporting
+# (configured on the repo's Security tab — see SECURITY.md).
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/vedanthvdev/affected-tests/security/advisories/new
+    about: Report a security issue privately. Do not file a public issue for a security report.
+  - name: Question or general discussion
+    url: https://github.com/vedanthvdev/affected-tests/discussions
+    about: Ask a question, share an adoption note, or propose a non-bug change.

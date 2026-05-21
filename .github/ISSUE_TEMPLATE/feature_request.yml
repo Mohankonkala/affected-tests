@@ -1,0 +1,69 @@
+name: Feature request
+description: A new capability or behaviour change the plugin should support.
+title: "feat: <one-line summary>"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing a feature. The plugin is in production use, so behaviour changes that affect the default mode profile or the situation→action mapping have a high bar. The form below frames the proposal in terms a maintainer can triage against the existing decision model.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: |
+        Describe the failure mode in terms of an adopter's experience — what diff did they push, what did the plugin do, and why was that wrong for them. The clearer the problem statement, the easier it is to evaluate solutions.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current-behaviour
+    attributes:
+      label: What does the plugin do today?
+      description: |
+        Paste the relevant `--explain` output, log line, or pointer to the existing code path. "Today" answers anchor the proposal in real behaviour rather than imagined behaviour.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-behaviour
+    attributes:
+      label: What should the plugin do instead?
+      description: |
+        Be specific. If this proposes a new situation, situation→action edge, mode profile, or DSL knob, name it and describe the contract.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: blast-radius
+    attributes:
+      label: Blast radius
+      description: |
+        How many existing adopters are affected by this change on a default-config build?
+      options:
+        - "Opt-in only (new DSL knob, default off)"
+        - "Mode-default flip on a non-default mode (e.g. strict)"
+        - "Mode-default flip on `auto` / `ci` (every adopter feels it)"
+        - "Compatibility-breaking (DSL renamed, situation removed)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: |
+        Existing DSL knobs, mode profiles, or workarounds that could solve this without a code change. "Why isn't `outOfScopeTestDirs` enough here?" is a fair question to pre-empt.
+    validations:
+      required: false
+
+  - type: textarea
+    id: related
+    attributes:
+      label: Related issues or PRs
+      description: |
+        Optional — link any prior discussion. Especially useful if this proposal extends or contradicts a previously-merged decision.
+    validations:
+      required: false
