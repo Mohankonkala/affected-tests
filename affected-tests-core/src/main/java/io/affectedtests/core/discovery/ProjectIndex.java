@@ -54,6 +54,17 @@ public final class ProjectIndex {
     }
 
     public static ProjectIndex build(Path projectDir, AffectedTestsConfig config) {
+        // Issue #41: try the persistent cache first. The validity contract
+        // (schemaVersion + configHash + per-scan-root mtime + child count)
+        // lives entirely inside ProjectIndexCache; any drift falls
+        // through to a full rebuild. A cache miss is exactly the
+        // pre-cache behaviour, so the worst case is unchanged.
+        if (Boolean.parseBoolean(System.getProperty("affected-tests.indexCache.enabled", "true"))) {
+            Optional<ProjectIndex> cached = ProjectIndexCache.tryLoad(projectDir, config);
+            if (cached.isPresent()) {
+                return cached.get();
+            }
+        }
         log.info("Building project index for {}", projectDir);
 
         // Share the exact matcher compilation PathToClassMapper uses so
@@ -70,12 +81,28 @@ public final class ProjectIndex {
                 config.outOfScopeTestDirs(), "outOfScopeTestDirs");
         boolean hasOutOfScope = !oosSourceMatchers.isEmpty() || !oosTestMatchers.isEmpty();
 
+        // Capture the resolved scan roots so the cache can fingerprint
+        // exactly what we walked — the mtime + child-count gate on each
+        // root is what makes the next-run fast path safe. Resolved roots
+        // are project-relative paths after glob/suffix expansion (e.g.
+        // "src/main/java", "services/orders/src/test/java"), filtered to
+        // the in-scope ones — out-of-scope dirs would still drift their
+        // mtime independently and force unnecessary cache misses if we
+        // recorded them.
+        List<Path> sourceRoots = new ArrayList<>();
+        List<Path> testRoots = new ArrayList<>();
+
         List<Path> sourceFiles = filterOutOfScope(
-                SourceFileScanner.collectSourceFiles(projectDir, config.sourceDirs()),
+                SourceFileScanner.collectSourceFiles(projectDir, config.sourceDirs(), sourceRoots),
                 projectDir, oosSourceMatchers, oosTestMatchers, hasOutOfScope);
         List<Path> testFiles = filterOutOfScope(
-                SourceFileScanner.collectTestFiles(projectDir, config.testDirs()),
+                SourceFileScanner.collectTestFiles(projectDir, config.testDirs(), testRoots),
                 projectDir, oosSourceMatchers, oosTestMatchers, hasOutOfScope);
+
+        if (hasOutOfScope) {
+            sourceRoots.removeIf(p -> isUnderAny(p, projectDir, oosSourceMatchers, oosTestMatchers));
+            testRoots.removeIf(p -> isUnderAny(p, projectDir, oosSourceMatchers, oosTestMatchers));
+        }
 
         LinkedHashMap<String, Path> testFqnToPath = SourceFileScanner.scanTestFqnsWithFiles(
                 projectDir, config.testDirs());
@@ -102,6 +129,33 @@ public final class ProjectIndex {
                 sourceFiles.size(), testFiles.size(), sourceFqns.size(), testFqnToPath.size(),
                 config.outOfScopeSourceDirs().size(), config.outOfScopeTestDirs().size());
 
+        ProjectIndex index = new ProjectIndex(
+                Collections.unmodifiableList(sourceFiles),
+                Collections.unmodifiableList(testFiles),
+                Collections.unmodifiableMap(testFqnToPath),
+                Collections.unmodifiableSet(sourceFqns)
+        );
+
+        if (Boolean.parseBoolean(System.getProperty("affected-tests.indexCache.enabled", "true"))) {
+            ProjectIndexCache.persist(projectDir, config, index,
+                    new ProjectIndexCache.ScannedDirs(sourceRoots, testRoots));
+        }
+        return index;
+    }
+
+    /**
+     * Reconstitutes a {@link ProjectIndex} from cached aggregates without
+     * doing any source-tree walking. Stage 1 of issue #41 surfaces the
+     * cache hit through this factory; everything else (lazy CU cache,
+     * parse-failure counter) initialises empty exactly as a freshly-built
+     * index does — the cache stores derived data, not parser state, so
+     * the first {@code compilationUnit(file)} call on a cached index
+     * still parses on demand.
+     */
+    static ProjectIndex fromCache(List<Path> sourceFiles,
+                                  List<Path> testFiles,
+                                  LinkedHashMap<String, Path> testFqnToPath,
+                                  Set<String> sourceFqns) {
         return new ProjectIndex(
                 Collections.unmodifiableList(sourceFiles),
                 Collections.unmodifiableList(testFiles),
