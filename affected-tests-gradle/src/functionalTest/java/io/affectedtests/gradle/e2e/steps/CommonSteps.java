@@ -59,6 +59,11 @@ public class CommonSteps {
         world.project().extendAffectedTestsBlock(groovySnippet);
     }
 
+    @Given("the build script also contains:")
+    public void theBuildScriptAlsoContains(String groovySnippet) throws Exception {
+        world.project().extendBuildScript(groovySnippet);
+    }
+
     @Given("the project is multi-module with sub-projects {string} and {string}")
     public void theProjectIsMultiModuleWith(String modA, String modB) throws Exception {
         world.project().convertToMultiModule(modA, modB);
