@@ -1,0 +1,56 @@
+name: Dependency Submission
+
+# Resolves the full Gradle dependency graph (including transitives) on
+# every push to master and submits it to GitHub's Dependency Graph API.
+# This is the baseline that the `dependency-review` job in ci.yml diffs
+# every PR against — without it, the PR-side action only sees direct
+# dependencies declared in build.gradle and would miss transitive bumps,
+# which is the most common path a malicious dependency lands through.
+#
+# Pairs with the SLSA build provenance attestation in release.yml to
+# close out the supply-chain ask in issue #83:
+#   - release.yml      — proves the *outbound* artifact came from this repo
+#   - dependency-submission.yml + ci.yml dependency-review — proves no
+#     known-vulnerable dependency lands in the *inbound* graph
+#
+# Runs on push:master only. Pull-request triggers are intentionally
+# excluded because (a) `contents: write` is required to submit, and a
+# PR from a fork cannot be granted that scope, and (b) submitting from
+# untrusted PR code would let a malicious PR pollute the baseline. The
+# PR-side check (dependency-review-action in ci.yml) is read-only.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  # Required by gradle/actions/dependency-submission to POST the resolved
+  # graph to /repos/{owner}/{repo}/dependency-graph/snapshots. This scope
+  # only allows writing to the dependency graph and the contents of the
+  # repository — it does not grant access to other resources. Confined
+  # to push:master so untrusted PR code never sees this token.
+  contents: write
+
+jobs:
+  dependency-submission:
+    runs-on: ubuntu-latest
+
+    # Every `uses:` below pins to a commit SHA — see ci.yml + release.yml
+    # for the rationale (mutable major-version tags are a supply-chain
+    # surface; SHAs are not). Dependabot's github-actions ecosystem keeps
+    # these in lockstep with the other workflows.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # gradle/actions/dependency-submission shares the gradle/actions
+      # monorepo with setup-gradle — same commit SHA at the same release.
+      # The action runs Gradle once with a dependency-extracting init
+      # script, captures the full resolved graph (including transitives
+      # the build.gradle manifest does not list), and submits it to
+      # GitHub's Dependency Graph API. The submitted graph is what the
+      # PR-side `dependency-review-action` in ci.yml compares against.
+      - uses: gradle/actions/dependency-submission@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6.1.0
