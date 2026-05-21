@@ -1353,7 +1353,21 @@ public abstract class AffectedTestTask extends DefaultTask {
         // changed-file-count was part of the hint gate, so deleting
         // it keeps the dispatch contract legible.
         switch (result.situation()) {
-            case DISCOVERY_SUCCESS     -> appendOutOfScopeMisconfigHint(lines, config, result);
+            case DISCOVERY_SUCCESS -> {
+                appendOutOfScopeMisconfigHint(lines, config, result);
+                // Independent diagnostic from the OOS-misconfig hint —
+                // both can fire on the same DISCOVERY_SUCCESS run when
+                // naming over-selects across packages and the
+                // out-of-scope dirs are silently misconfigured. They
+                // describe orthogonal misconfigurations, so the
+                // operator gets both signals; the renderer ordering
+                // (OOS first, naming second) follows decreasing
+                // signal-to-noise — OOS misconfig is more likely to
+                // explain "why is the suite running at all" while the
+                // naming hint refines "which tests in particular look
+                // questionable".
+                appendNamingCrossPackageHint(lines, result);
+            }
             case DISCOVERY_EMPTY       -> appendDiscoveryEmptyHint(lines, config, result);
             case DISCOVERY_INCOMPLETE  -> appendDiscoveryIncompleteHint(lines, result);
             default                    -> {
@@ -1404,6 +1418,59 @@ public abstract class AffectedTestTask extends DefaultTask {
                 + totalEntries + " " + entryWord + ") but no file in the diff matched.");
         lines.add("                 Values are directory prefixes "
                 + "(e.g. 'api-test/src/test/java') or globs (e.g. 'api-test/**').");
+    }
+
+    /**
+     * Fires on {@link Situation#DISCOVERY_SUCCESS} when
+     * {@link NamingConventionStrategy} added at least one test whose
+     * package differs from the changed production class's package. The
+     * naming strategy is intentionally package-agnostic (issue #40
+     * rationale: parallel test trees and Cucumber-shape harnesses
+     * legitimately keep tests outside the SUT's package, so flipping
+     * to a strict same-package match would silently under-select), so
+     * over-selection is the policy's known failure mode; this hint
+     * surfaces it without flipping the policy. Quiet when there are
+     * no cross-package matches — the silent-success path stays silent.
+     *
+     * <p>Caps the listed pairs at {@link #EXPLAIN_SAMPLE_LIMIT} to
+     * keep the trace readable on monorepos where dozens of FQNs may
+     * over-select; an "(+N more)" suffix preserves the total so an
+     * operator can decide whether to dig deeper.
+     */
+    private static void appendNamingCrossPackageHint(List<String> lines, AffectedTestsResult result) {
+        Map<String, Set<String>> matches = result.namingCrossPackageMatches();
+        if (matches.isEmpty()) {
+            return;
+        }
+        int total = matches.values().stream().mapToInt(Set::size).sum();
+        String pairWord = total == 1 ? "test" : "tests";
+        lines.add("Hint:            naming strategy selected " + total
+                + " " + pairWord + " whose package differs from the "
+                + "changed production class's package — possible "
+                + "cross-package simple-name collision.");
+        int rendered = 0;
+        for (var entry : matches.entrySet()) {
+            for (String testFqn : entry.getValue()) {
+                if (rendered >= EXPLAIN_SAMPLE_LIMIT) {
+                    break;
+                }
+                lines.add("                  * " + entry.getKey() + " → " + testFqn);
+                rendered++;
+            }
+            if (rendered >= EXPLAIN_SAMPLE_LIMIT) {
+                break;
+            }
+        }
+        if (total > rendered) {
+            lines.add("                  … (+" + (total - rendered)
+                    + " more — set --info to log every naming match)");
+        }
+        lines.add("                 If this is a false positive (different "
+                + "production class, same simple name), the test is still "
+                + "selected — over-select is the documented trade-off for "
+                + "naming. Move the test into the same package as the SUT, "
+                + "or rename one of the colliding production classes, to "
+                + "make the match precise.");
     }
 
     /**

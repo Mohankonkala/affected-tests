@@ -165,6 +165,22 @@ public final class AffectedTestsEngine {
      * @param escalationReason         reason code derived from the
      *                                 {@link #situation}/{@link #action}
      *                                 pair; see {@link EscalationReason}
+     * @param namingCrossPackageMatches diagnostic map of changed
+     *                                 production FQN -> set of test FQNs
+     *                                 that {@link NamingConventionStrategy}
+     *                                 selected via simple-name match
+     *                                 even though the test lives in a
+     *                                 different package. Empty when
+     *                                 naming wasn't enabled, when no
+     *                                 cross-package matches occurred, or
+     *                                 when the engine short-circuited
+     *                                 before discovery. Surfaced on
+     *                                 {@code DISCOVERY_SUCCESS} runs by
+     *                                 the {@code --explain} renderer so
+     *                                 over-selection is visible without
+     *                                 changing the (deliberately
+     *                                 package-agnostic) selection
+     *                                 policy.
      */
     public record AffectedTestsResult(
             Set<String> testClassFqns,
@@ -177,8 +193,42 @@ public final class AffectedTestsEngine {
             boolean skipped,
             Situation situation,
             Action action,
-            EscalationReason escalationReason
-    ) {}
+            EscalationReason escalationReason,
+            Map<String, Set<String>> namingCrossPackageMatches
+    ) {
+        public AffectedTestsResult {
+            namingCrossPackageMatches = namingCrossPackageMatches == null
+                    ? Map.of()
+                    : Collections.unmodifiableMap(namingCrossPackageMatches);
+        }
+
+        /**
+         * Backwards-compatible 11-arg constructor — preserves the
+         * record shape every test fixture and downstream caller was
+         * written against before issue #40 added the
+         * {@code namingCrossPackageMatches} diagnostic. Defaults the
+         * new field to {@link Map#of()}, matching what every
+         * non-DISCOVERY_SUCCESS engine path already produces.
+         */
+        public AffectedTestsResult(
+                Set<String> testClassFqns,
+                Map<String, Path> testFqnToPath,
+                Set<String> changedFiles,
+                Set<String> changedProductionClasses,
+                Set<String> changedTestClasses,
+                Buckets buckets,
+                boolean runAll,
+                boolean skipped,
+                Situation situation,
+                Action action,
+                EscalationReason escalationReason
+        ) {
+            this(testClassFqns, testFqnToPath, changedFiles,
+                    changedProductionClasses, changedTestClasses,
+                    buckets, runAll, skipped, situation, action,
+                    escalationReason, Map.of());
+        }
+    }
 
     /**
      * Runs the full pipeline: detect changes, map to classes, pick a
@@ -409,6 +459,14 @@ public final class AffectedTestsEngine {
         // log line at INFO/--info level.
         allTestsToRun.forEach(t -> log.info("  -> {}", LogSanitizer.sanitize(t)));
 
+        // Trim the diagnostic map to FQNs that actually survived the
+        // on-disk filter: a cross-package match for a test that was
+        // deleted in the same diff (or never existed) is noise that
+        // would point operators at FQNs they can't open.
+        Map<String, Set<String>> survivingCrossPackage =
+                filterCrossPackageMatchesToSurvivors(
+                        namingStrategy.crossPackageMatches(), allTestsToRun);
+
         return new AffectedTestsResult(
                 allTestsToRun,
                 Collections.unmodifiableMap(fqnToPath),
@@ -420,7 +478,8 @@ public final class AffectedTestsEngine {
                 false,
                 finalSituation,
                 Action.SELECTED,
-                EscalationReason.NONE
+                EscalationReason.NONE,
+                survivingCrossPackage
         );
     }
 
@@ -569,8 +628,40 @@ public final class AffectedTestsEngine {
                 skipped,
                 situation,
                 action,
-                escalationReason(situation, action)
+                escalationReason(situation, action),
+                Map.of()
         );
+    }
+
+    /**
+     * Drops cross-package naming matches whose test FQN didn't survive
+     * the on-disk filter so the {@code --explain} hint never points
+     * operators at a deleted/missing test. Also prunes entries whose
+     * surviving set is empty (every cross-package match for that
+     * changed FQN was filtered) — the renderer treats an entry's
+     * presence as "this changed FQN over-selected" so an empty set
+     * would render misleadingly. Returns an empty map when nothing
+     * survives, matching the {@code Map.of()} default in the no-naming
+     * / no-discovery short-circuits.
+     */
+    private static Map<String, Set<String>> filterCrossPackageMatchesToSurvivors(
+            Map<String, Set<String>> raw, Set<String> survivingTests) {
+        if (raw.isEmpty()) {
+            return Map.of();
+        }
+        Map<String, Set<String>> filtered = new LinkedHashMap<>();
+        for (var entry : raw.entrySet()) {
+            Set<String> survivingForKey = new LinkedHashSet<>();
+            for (String testFqn : entry.getValue()) {
+                if (survivingTests.contains(testFqn)) {
+                    survivingForKey.add(testFqn);
+                }
+            }
+            if (!survivingForKey.isEmpty()) {
+                filtered.put(entry.getKey(), survivingForKey);
+            }
+        }
+        return filtered;
     }
 
     private static EscalationReason escalationReason(Situation situation, Action action) {
