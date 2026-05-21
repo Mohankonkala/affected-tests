@@ -7,7 +7,7 @@ dependencies {
     // JavaParser types, so these are implementation-only. The plugin module
     // shades them into the published JAR anyway.
     implementation 'org.eclipse.jgit:org.eclipse.jgit:7.6.0.202603022253-r'
-    implementation 'com.github.javaparser:javaparser-core:3.28.0'
-    implementation 'org.slf4j:slf4j-api:2.0.17'
-    testImplementation 'org.slf4j:slf4j-simple:2.0.17'
+    implementation 'com.github.javaparser:javaparser-core:3.28.1'
+    implementation 'org.slf4j:slf4j-api:2.0.18'
+    testImplementation 'org.slf4j:slf4j-simple:2.0.18'
 }

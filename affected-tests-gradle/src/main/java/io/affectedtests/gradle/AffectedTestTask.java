@@ -22,6 +22,7 @@ import org.gradle.api.tasks.TaskAction;
 import org.gradle.api.tasks.options.Option;
 import org.gradle.process.ExecOperations;
 import org.gradle.process.ExecResult;
+import org.gradle.work.DisableCachingByDefault;
 
 import javax.inject.Inject;
 import java.io.File;
@@ -61,7 +62,18 @@ import java.util.stream.Collectors;
  * <p>The task is deliberately marked as never up-to-date
  * ({@code outputs.upToDateWhen(t -> false)}) so a real git change always
  * triggers a re-run; that's an up-to-date concern, independent of CC.
+ *
+ * <p>The build cache is disabled for the same reason the up-to-date
+ * check is: the task has no cacheable outputs (it dispatches {@code
+ * :test} runs and writes nothing of its own), and its work depends on
+ * live git state which the build cache cannot key on. Gradle 9.5+'s
+ * {@code validatePlugins} requires this be declared explicitly.
  */
+@DisableCachingByDefault(because =
+        "AffectedTestTask is a dispatcher: it reads live git state, "
+                + "selects affected tests, and forwards to :test. It produces "
+                + "no cacheable outputs and is forced never-up-to-date so a "
+                + "real git change always triggers a re-run.")
 public abstract class AffectedTestTask extends DefaultTask {
 
     public AffectedTestTask() {
