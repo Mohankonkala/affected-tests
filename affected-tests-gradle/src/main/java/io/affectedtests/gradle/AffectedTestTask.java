@@ -9,6 +9,7 @@ import io.affectedtests.core.config.ActionSource;
 import io.affectedtests.core.config.AffectedTestsConfig;
 import io.affectedtests.core.config.Mode;
 import io.affectedtests.core.config.Situation;
+import io.affectedtests.core.discovery.DiscoveryProfile;
 import io.affectedtests.core.util.LogSanitizer;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.GradleException;
@@ -141,6 +142,18 @@ public abstract class AffectedTestTask extends DefaultTask {
      */
     @Input
     public abstract Property<Integer> getTransitiveDepth();
+
+    /**
+     * Whether to fan the four discovery strategies out across a small
+     * thread pool (default {@code true}, issue #42). Wired from the
+     * {@code parallelDiscovery} extension property; can also be
+     * overridden per-invocation via the Gradle property
+     * {@code -PaffectedTestsParallelDiscovery=false}.
+     *
+     * @return the parallel-discovery property
+     */
+    @Input
+    public abstract Property<Boolean> getParallelDiscovery();
 
     /**
      * Suffixes used by the naming strategy to find test classes.
@@ -495,7 +508,8 @@ public abstract class AffectedTestTask extends DefaultTask {
                 .testDirs(getTestDirs().get())
                 .testTaskNames(getTestTaskNames().get())
                 .includeImplementationTests(getIncludeImplementationTests().get())
-                .implementationNaming(getImplementationNaming().get());
+                .implementationNaming(getImplementationNaming().get())
+                .parallelDiscovery(getParallelDiscovery().getOrElse(true));
 
         if (getIgnorePaths().isPresent() && !getIgnorePaths().get().isEmpty()) {
             builder.ignorePaths(getIgnorePaths().get());
@@ -1443,6 +1457,15 @@ public abstract class AffectedTestTask extends DefaultTask {
         }
         lines.add("Outcome:         " + outcome);
 
+        // Issue #42: the discovery profile is the data adopters need
+        // to answer "did parallel actually help on my workload?" and
+        // "which strategy is the wall-time hog?". We render a
+        // breakdown only when discovery actually ran (test-only fast
+        // paths, EMPTY_DIFF, etc., produce DiscoveryProfile.empty()
+        // which we deliberately skip — no point printing "0ms total"
+        // for a situation that didn't dispatch any work).
+        appendDiscoveryProfile(lines, result);
+
         // Diagnostic hint: pick the hint that actually matches the
         // situation the operator is staring at. Earlier versions
         // unconditionally printed the out-of-scope hint on every
@@ -1823,6 +1846,72 @@ public abstract class AffectedTestTask extends DefaultTask {
     }
 
     /**
+     * Renders the discovery profile (issue #42) so adopters can see
+     * directly from {@code --explain} how dispatch executed and which
+     * strategy is the dominant wall-time consumer. Format:
+     * <pre>
+     * Discovery:       parallel (4 threads, 12.3ms total)
+     *   naming     :   0.8ms (2 tests)
+     *   usage      :   4.5ms (5 tests)
+     *   impl       :   2.1ms (1 test)
+     *   transitive :  11.9ms (3 tests, dominant)
+     * </pre>
+     *
+     * <p>Empty profiles (test-only fast path, EMPTY_DIFF, etc.) are
+     * skipped on purpose — printing "0ms total" would just add a
+     * meaningless line for situations that didn't run discovery.
+     *
+     * <p>Sub-millisecond timings round to {@code 0ms} in the output;
+     * we intentionally don't print microseconds because a) the
+     * dominant signal at that scale is JVM warm-up, not strategy
+     * cost, and b) test snapshots that pin millisecond-rounded
+     * output won't churn on every run. The dominant-strategy hint
+     * is delegated to
+     * {@link DiscoveryProfile#dominantStrategy()} so the record and
+     * the renderer agree on what "dominant" means; the renderer
+     * adds the trace-only floor (multi-strategy + ≥1ms total) on
+     * top of that single source of truth.
+     *
+     * <p>Package-private so {@code AffectedTestTaskExplainFormatTest}
+     * can pin both the empty-profile fast path and the rendered
+     * shape without spinning up Gradle.
+     */
+    static void appendDiscoveryProfile(List<String> lines, AffectedTestsResult result) {
+        DiscoveryProfile profile = result.discoveryProfile();
+        if (profile == null
+                || profile.perStrategyWallTime().isEmpty()
+                || profile.totalDiscoveryWallTime().isZero()) {
+            return;
+        }
+        String header = profile.parallelEnabled()
+                ? "parallel (" + profile.concurrencyLevel() + " threads, "
+                        + profile.totalDiscoveryWallTime().toMillis() + "ms total)"
+                : "serial (" + profile.totalDiscoveryWallTime().toMillis() + "ms total)";
+        lines.add("Discovery:       " + header);
+
+        // Trace-only floor: only flag a dominant strategy when the
+        // total wall time is at least 1ms. Anything finer is JVM-
+        // warmup noise that shouldn't drive the operator's attention.
+        // {@link DiscoveryProfile#dominantStrategy()} already
+        // enforces "more than one strategy ran" and "strictly greater
+        // than runner-up" — we just gate on the floor here.
+        String dominant = null;
+        if (profile.totalDiscoveryWallTime().toMillis() >= 1) {
+            dominant = profile.dominantStrategy();
+        }
+
+        for (Map.Entry<String, java.time.Duration> e : profile.perStrategyWallTime().entrySet()) {
+            String strategyName = e.getKey();
+            long ms = e.getValue().toMillis();
+            int testCount = profile.perStrategyTestCount().getOrDefault(strategyName, 0);
+            String testWord = testCount == 1 ? "test" : "tests";
+            String marker = strategyName.equals(dominant) ? ", dominant" : "";
+            lines.add(String.format(Locale.ROOT, "  %-11s: %4dms (%d %s%s)",
+                    strategyName, ms, testCount, testWord, marker));
+        }
+    }
+
+    /**
      * Renders the "Modules:" section of the {@code --explain} trace.
      * No-op when the map is empty — every non-SELECTED run threads an
      * empty map through so those traces stay compact. On SELECTED
@@ -2027,8 +2116,14 @@ public abstract class AffectedTestTask extends DefaultTask {
     // --explain JSON output (issue #53)
     // ─────────────────────────────────────────────────────────────────
 
-    /** Schema version for {@link #renderExplainJson}. Bump on breaking changes. */
-    static final int EXPLAIN_JSON_SCHEMA_VERSION = 1;
+    /**
+     * Schema version for {@link #renderExplainJson}. Bumped to 2 in
+     * issue #42 to add the additive {@code discovery} block (parallel
+     * flag, concurrency level, total wall time, per-strategy timings
+     * and contribution counts). All v1 fields remain present so
+     * existing consumers keep working without changes.
+     */
+    static final int EXPLAIN_JSON_SCHEMA_VERSION = 2;
 
     /**
      * Resolves and validates the {@code --explain-format} argument.
@@ -2170,6 +2265,32 @@ public abstract class AffectedTestTask extends DefaultTask {
         }
         json.append("],");
 
+        // Discovery profile (issue #42, schema v2). Always present so
+        // consumers can iterate without null-checking; an
+        // empty-strategy case (test-only fast path, EMPTY_DIFF) shows
+        // up as `parallelEnabled: false`, `concurrencyLevel: 0`,
+        // `totalMillis: 0`, and an empty `perStrategy` array.
+        DiscoveryProfile profile = result.discoveryProfile();
+        json.append("\"discovery\":{");
+        appendJsonField(json, "parallelEnabled", profile.parallelEnabled());
+        json.append(',');
+        appendJsonField(json, "concurrencyLevel", profile.concurrencyLevel()); json.append(',');
+        appendJsonField(json, "totalMillis", (int) profile.totalDiscoveryWallTime().toMillis());
+        json.append(',');
+        json.append("\"perStrategy\":[");
+        boolean firstStrategy = true;
+        for (Map.Entry<String, java.time.Duration> e : profile.perStrategyWallTime().entrySet()) {
+            if (!firstStrategy) json.append(',');
+            firstStrategy = false;
+            json.append('{');
+            appendJsonField(json, "name", e.getKey()); json.append(',');
+            appendJsonField(json, "millis", (int) e.getValue().toMillis()); json.append(',');
+            appendJsonField(json, "tests",
+                    profile.perStrategyTestCount().getOrDefault(e.getKey(), 0));
+            json.append('}');
+        }
+        json.append("]},");
+
         // The action matrix is cheap to serialise (5 entries) and
         // invaluable for "why did my explicit setting not win"
         // dashboards. Same shape as the text trace's "Action matrix"
@@ -2222,6 +2343,10 @@ public abstract class AffectedTestTask extends DefaultTask {
     }
 
     private static void appendJsonField(StringBuilder json, String key, int value) {
+        json.append('"').append(jsonEscape(key)).append("\":").append(value);
+    }
+
+    private static void appendJsonField(StringBuilder json, String key, boolean value) {
         json.append('"').append(jsonEscape(key)).append("\":").append(value);
     }
 

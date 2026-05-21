@@ -11,3 +11,20 @@ dependencies {
     implementation 'org.slf4j:slf4j-api:2.0.18'
     testImplementation 'org.slf4j:slf4j-simple:2.0.18'
 }
+
+// Forward the specific affected-tests.* system properties that the
+// issue #42 perf harness consumes, so it can be steered from the CLI
+// without rebuilding (e.g. -Daffected-tests.perfHarness.sizes=200,1000).
+// We use the providers chain (read at execution time) rather than
+// `System.getProperties()` (read at configuration time) so this stays
+// configuration-cache compatible. We also use `systemProperty key val`
+// (single-key augmentation) instead of `systemProperties = …`
+// (whole-map replacement) so we don't clobber sysprops injected by
+// other plugins (jacoco, kotlin daemon, …).
+['affected-tests.perfHarness.sizes',
+ 'affected-tests.perfHarness.iterations'].each { String key ->
+    def value = providers.systemProperty(key)
+    if (value.present) {
+        test.systemProperty(key, value.get())
+    }
+}

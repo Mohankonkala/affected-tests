@@ -9,6 +9,8 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 
 /**
@@ -17,8 +19,15 @@ import java.util.function.Predicate;
  * across strategies.
  *
  * <p>{@link CompilationUnit}s are parsed lazily on first access and cached.
- * Callers MUST NOT use the returned CU from multiple threads concurrently —
- * JavaParser ASTs are not thread-safe.
+ * <strong>Thread-safety contract (issue #42)</strong>: the lookup map and
+ * parse-failure counter are safe under concurrent {@link #compilationUnit}
+ * calls from multiple discovery strategies, and the parser itself is held
+ * in a {@link ThreadLocal} so each thread parses with its own
+ * {@link JavaParser} instance (JavaParser's mutable parser-config and
+ * symbol-resolver state make a single shared parser unsafe to invoke
+ * concurrently). Callers still MUST NOT use the returned CU from
+ * multiple threads concurrently — that's a JavaParser AST constraint
+ * that no amount of cache wrapping can paper over.
  */
 public final class ProjectIndex {
 
@@ -29,21 +38,65 @@ public final class ProjectIndex {
     private final Map<String, Path> testFqnToPath;
     private final Set<String> sourceFqns;
 
-    // Lazy AST cache. null entries mean "parsed but invalid/empty".
-    private final Map<Path, CompilationUnit> cuCache = new HashMap<>();
-    private final JavaParser parser = JavaParsers.newParser();
+    /**
+     * Lazy AST cache. Holds {@code Optional.empty()} for paths that
+     * parseOrWarn returned null for, since {@link ConcurrentHashMap}
+     * disallows null values. Switching to {@link ConcurrentHashMap}
+     * (issue #42) lets multiple discovery strategies request CUs
+     * concurrently without racing on {@code containsKey}/{@code put}.
+     * Compute happens through {@link Map#computeIfAbsent} so a single
+     * file is parsed at most once even when N threads request it
+     * simultaneously.
+     */
+    private final ConcurrentHashMap<Path, Optional<CompilationUnit>> cuCache =
+            new ConcurrentHashMap<>();
 
-    // Count of distinct files that {@link JavaParsers#parseOrWarn} returned
-    // null for. The engine consults this after discovery to decide whether
-    // to route through {@link io.affectedtests.core.config.Situation#DISCOVERY_INCOMPLETE}:
-    // a parse failure silently drops the affected file from Usage /
-    // Implementation / Transitive strategies, and before v1.9.22 the only
-    // signal was a WARN at parse time — the engine itself couldn't tell
-    // a clean empty selection apart from "we couldn't read half the
-    // tests". Counting at the index boundary (not at each strategy)
-    // de-duplicates across strategies — the shared cache means one file
-    // parses once per run regardless of how many strategies consult it.
-    private int parseFailureCount = 0;
+    /**
+     * Per-thread parser. JavaParser instances are not safe to share
+     * across threads (their {@code ParserConfiguration} is mutated
+     * during parse and the symbol-resolver state is per-instance).
+     * {@code ThreadLocal.withInitial} keeps the construction cost off
+     * the critical path — each thread builds its parser exactly
+     * once, on its first compilationUnit() call.
+     *
+     * <p>Held as a {@code static} field on purpose. An instance-level
+     * ThreadLocal would entry a fresh slot in every running thread's
+     * {@code ThreadLocalMap} for every engine run; on the serial path
+     * the calling thread is a Gradle-daemon worker that lives across
+     * builds, and the {@code JavaParser} values would leak ~30–80 KB
+     * each until the worker dies (`ThreadLocalMap` only expunges
+     * stale entries opportunistically). Promoting to {@code static}
+     * gives us one parser per thread, shared across every engine run
+     * the JVM serves — bounded growth, zero adopter cost. Pool
+     * threads on the parallel path are daemons that die at
+     * {@code shutdown()}, so they shed their parser entries
+     * naturally.
+     */
+    private static final ThreadLocal<JavaParser> PARSER =
+            ThreadLocal.withInitial(JavaParsers::newParser);
+
+    /**
+     * Count of distinct files that {@link JavaParsers#parseOrWarn}
+     * returned null for. The engine consults this after discovery to
+     * decide whether to route through
+     * {@link io.affectedtests.core.config.Situation#DISCOVERY_INCOMPLETE}:
+     * a parse failure silently drops the affected file from Usage /
+     * Implementation / Transitive strategies, and before v1.9.22 the
+     * only signal was a WARN at parse time — the engine itself
+     * couldn't tell a clean empty selection apart from "we couldn't
+     * read half the tests". Counting at the index boundary (not at
+     * each strategy) de-duplicates across strategies — the shared
+     * cache means one file parses once per run regardless of how
+     * many strategies consult it.
+     *
+     * <p>Backed by {@link AtomicInteger} (issue #42) so the increment
+     * is safe under parallel discovery; the de-dup contract relies
+     * on {@link ConcurrentHashMap#computeIfAbsent} running its
+     * mapping function exactly once per absent key, so a parse
+     * failure is observed (and counted) by exactly one thread even
+     * when N threads race to request the same unparseable file.
+     */
+    private final AtomicInteger parseFailureCount = new AtomicInteger();
 
     private ProjectIndex(List<Path> sourceFiles, List<Path> testFiles,
                          Map<String, Path> testFqnToPath, Set<String> sourceFqns) {
@@ -214,24 +267,22 @@ public final class ProjectIndex {
      * {@code null} if the file cannot be parsed (malformed source, I/O error).
      *
      * <p>Results are shared across strategies so the same test file is parsed
-     * at most once per engine run.
+     * at most once per engine run, even when N strategies request it
+     * concurrently from different threads. The compute-once guarantee
+     * comes from {@link java.util.concurrent.ConcurrentHashMap#computeIfAbsent};
+     * the same primitive ensures the parse-failure count is
+     * incremented at most once per failing file no matter how many
+     * threads race to ask for it.
      */
     public CompilationUnit compilationUnit(Path file) {
-        if (cuCache.containsKey(file)) {
-            return cuCache.get(file);
-        }
-        CompilationUnit cu = JavaParsers.parseOrWarn(parser, file, "index");
-        cuCache.put(file, cu);
-        if (cu == null) {
-            // First-time miss for this path: a WARN has already been
-            // emitted by parseOrWarn. Counting here (not at each
-            // strategy call site) naturally de-duplicates — the cached
-            // null return on subsequent calls for the same file does
-            // not re-increment, so a file that fails to parse once is
-            // counted once no matter how many strategies consult it.
-            parseFailureCount++;
-        }
-        return cu;
+        Optional<CompilationUnit> entry = cuCache.computeIfAbsent(file, key -> {
+            CompilationUnit cu = JavaParsers.parseOrWarn(PARSER.get(), key, "index");
+            if (cu == null) {
+                parseFailureCount.incrementAndGet();
+            }
+            return Optional.ofNullable(cu);
+        });
+        return entry.orElse(null);
     }
 
     /**
@@ -246,7 +297,7 @@ public final class ProjectIndex {
      * @return the de-duplicated count of files that failed to parse
      */
     public int parseFailureCount() {
-        return parseFailureCount;
+        return parseFailureCount.get();
     }
 
     /**

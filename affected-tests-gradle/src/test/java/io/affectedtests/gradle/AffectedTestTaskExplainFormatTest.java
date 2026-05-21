@@ -1398,4 +1398,148 @@ class AffectedTestTaskExplainFormatTest {
                 "Plural fallthrough on count=1 would look like a generated-from-template "
                         + "bug and cost the signal its credibility. Got: " + message);
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Issue #42: Discovery profile rendering
+    // ─────────────────────────────────────────────────────────────────
+
+    @Test
+    void discoveryBlockSurfacesParallelMetadataAndPerStrategyTimings() {
+        AffectedTestsConfig config = AffectedTestsConfig.builder().mode(Mode.LOCAL).build();
+        Buckets buckets = new Buckets(Set.of(), Set.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of(), Set.of());
+        io.affectedtests.core.discovery.DiscoveryProfile profile =
+                new io.affectedtests.core.discovery.DiscoveryProfile(
+                        true, 4,
+                        java.time.Duration.ofMillis(13),
+                        java.util.Map.of(
+                                "naming",     java.time.Duration.ofMillis(2),
+                                "usage",      java.time.Duration.ofMillis(4),
+                                "impl",       java.time.Duration.ofMillis(3),
+                                "transitive", java.time.Duration.ofMillis(11)),
+                        java.util.Map.of(
+                                "naming", 2, "usage", 5, "impl", 1, "transitive", 3));
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of("com.example.FooTest"), Map.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of("com.example.Foo"), Set.of(),
+                buckets,
+                false, false,
+                Situation.DISCOVERY_SUCCESS,
+                Action.SELECTED,
+                EscalationReason.NONE,
+                Map.of(),
+                profile);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("Discovery:       parallel (4 threads, 13ms total)"),
+                "Discovery header must report parallel + thread count + total wall "
+                        + "time so adopters can judge whether parallel is helping. "
+                        + "Got:\n" + trace);
+        assertTrue(trace.contains("naming     :    2ms (2 tests)"),
+                "Per-strategy line must show name, ms, and contribution count. Got:\n" + trace);
+        assertTrue(trace.contains("transitive :   11ms (3 tests, dominant)"),
+                "Dominant strategy must be flagged so operators know which strategy "
+                        + "is the wall-time hog — that's the key data for deciding "
+                        + "whether Option 1 (intra-strategy parallelism) is worth "
+                        + "the engineering cost. Got:\n" + trace);
+    }
+
+    @Test
+    void discoveryBlockReportsSerialModeWhenParallelDisabled() {
+        AffectedTestsConfig config = AffectedTestsConfig.builder().mode(Mode.LOCAL).build();
+        Buckets buckets = new Buckets(Set.of(), Set.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of(), Set.of());
+        io.affectedtests.core.discovery.DiscoveryProfile profile =
+                new io.affectedtests.core.discovery.DiscoveryProfile(
+                        false, 0,
+                        java.time.Duration.ofMillis(20),
+                        java.util.Map.of(
+                                "naming", java.time.Duration.ofMillis(8),
+                                "usage",  java.time.Duration.ofMillis(12)),
+                        java.util.Map.of("naming", 1, "usage", 1));
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of("com.example.FooTest"), Map.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of("com.example.Foo"), Set.of(),
+                buckets,
+                false, false,
+                Situation.DISCOVERY_SUCCESS,
+                Action.SELECTED,
+                EscalationReason.NONE,
+                Map.of(),
+                profile);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("Discovery:       serial (20ms total)"),
+                "Serial mode must be visibly different from parallel — adopters who "
+                        + "hit the kill switch (-PaffectedTestsParallelDiscovery=false) "
+                        + "need to be able to verify the flag took effect. Got:\n" + trace);
+        assertFalse(trace.contains("threads"),
+                "Serial mode must not name a thread count — there is no pool. "
+                        + "Got:\n" + trace);
+    }
+
+    @Test
+    void discoveryBlockOmittedOnEmptyProfile() {
+        AffectedTestsConfig config = AffectedTestsConfig.builder().mode(Mode.LOCAL).build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of(), Map.of(),
+                Set.of(), Set.of(), Set.of(),
+                Buckets.empty(),
+                false, true,
+                Situation.EMPTY_DIFF,
+                Action.SKIPPED,
+                EscalationReason.NONE,
+                Map.of(),
+                io.affectedtests.core.discovery.DiscoveryProfile.empty());
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertFalse(trace.contains("Discovery:"),
+                "Empty profile (test-only fast path / EMPTY_DIFF) must NOT render "
+                        + "a Discovery block — printing '0ms total' for a path that "
+                        + "didn't run discovery would clutter the trace and mislead "
+                        + "operators into thinking discovery is broken. Got:\n" + trace);
+    }
+
+    @Test
+    void discoveryBlockNeverFlagsDominantOnSingleStrategyRun() {
+        AffectedTestsConfig config = AffectedTestsConfig.builder().mode(Mode.LOCAL).build();
+        Buckets buckets = new Buckets(Set.of(), Set.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of(), Set.of());
+        io.affectedtests.core.discovery.DiscoveryProfile profile =
+                new io.affectedtests.core.discovery.DiscoveryProfile(
+                        false, 0,
+                        java.time.Duration.ofMillis(5),
+                        java.util.Map.of("naming", java.time.Duration.ofMillis(5)),
+                        java.util.Map.of("naming", 1));
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of("com.example.FooTest"), Map.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of("com.example.Foo"), Set.of(),
+                buckets,
+                false, false,
+                Situation.DISCOVERY_SUCCESS,
+                Action.SELECTED,
+                EscalationReason.NONE,
+                Map.of(),
+                profile);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("Discovery:       serial (5ms total)"),
+                "Single-strategy serial run must still show the discovery block. "
+                        + "Got:\n" + trace);
+        assertFalse(trace.contains(", dominant"),
+                "Dominant marker must NOT fire when only one strategy ran — "
+                        + "calling a sole strategy 'dominant' has no semantic content "
+                        + "and would mislead operators into thinking parallel "
+                        + "would have helped. Got:\n" + trace);
+    }
 }

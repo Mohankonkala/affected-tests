@@ -4,6 +4,83 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added — engine-level parallel discovery (issue #42)
+
+The four discovery strategies (naming, usage, impl, transitive) now
+fan out across a small thread pool sized to
+`min(strategies, availableProcessors)`. The pool is gated on
+`availableProcessors() > 1`, so single-vCPU hosts (cgroups-pinned
+containers, GitHub Actions free runners) automatically collapse back
+to the in-line serial path where the pool would just add overhead. On
+multi-vCPU hosts a synthetic workload sweep at 200/500/1000/3000/5000
+classes shows 2.0–3.3× wall-time speedup on the discovery phase; the
+`Foo-service` pilot project sees ~10% real-world speedup
+(1700ms → 1520ms). The smaller real-world delta is expected — the
+remaining contention is on a per-file `ConcurrentHashMap.computeIfAbsent`
+in the parsed-CU cache, which the deeper intra-strategy parallelism
+work (issue #42 "Option 1") can address in a follow-up if adopter
+data justifies the engineering cost.
+
+The kill switch is a single line in `build.gradle`:
+
+```groovy
+affectedTests {
+    parallelDiscovery = false
+}
+```
+
+…or `-PaffectedTestsParallelDiscovery=false` on the CLI for one-off
+investigation. The CLI flag accepts the human-friendly aliases
+`true|false|1|0|on|off|yes|no` (case-insensitive); typo'd values are
+rejected with a build-log WARN rather than silently flipping the
+switch via `Boolean.parseBoolean`'s permissive default.
+
+### Added — `Discovery:` block in `--explain` output
+
+The `--explain` trace and JSON now include per-run discovery diagnostics
+so adopters can see directly which strategy is the wall-time hog and
+whether parallel actually helped on their workload:
+
+```
+Discovery:       parallel (4 threads, 12ms total)
+  naming     :    1ms (2 tests)
+  usage      :    4ms (5 tests)
+  impl       :    2ms (1 test)
+  transitive :   11ms (3 tests, dominant)
+```
+
+The JSON `discovery` field bumps the explain-JSON schema from `v1` to
+`v2` (non-breaking — every `v1` field is preserved). The new fields
+are `parallelEnabled`, `concurrencyLevel`, `totalMillis`, and a
+`perStrategy` array with `name`, `wallMillis`, and `testCount`.
+
+### Added — `DiscoveryProfile` on `AffectedTestsResult`
+
+A new `discoveryProfile()` method on the public `AffectedTestsResult`
+record exposes the same parallel/serial + per-strategy + total-wall-time
+data programmatically, so anyone embedding the engine outside Gradle
+can read it without parsing `--explain` output. The pre-issue-#42
+constructor signatures are preserved unchanged for source compatibility.
+
+### Changed — thread-safety pass on `ProjectIndex` and `NamingConventionStrategy`
+
+`ProjectIndex.cuCache` is now a `ConcurrentHashMap<Path, Optional<CompilationUnit>>`
+with `computeIfAbsent` enforcing the "parse-once" contract under
+contention. `parseFailureCount` is an `AtomicInteger` so the
+issue-#41 de-dup invariant survives concurrent failure cases. The
+JavaParser instance is held per-thread via a `static ThreadLocal`,
+honouring JavaParser's documented per-instance mutability contract.
+`NamingConventionStrategy.crossPackageMatches` is a
+`ConcurrentHashMap` with `Collections.synchronizedSet(LinkedHashSet)`
+values, and the cross-package iteration order is sorted at filter
+time so the `--explain` text output stays deterministic across runs.
+
+None of these changes are adopter-visible on green paths. They exist
+purely to make the new fan-out safe; the serial path picks them up
+for free.
+
 ## [v2.2.1] — code-review follow-ups after the v2.2 ship
 
 v2.2.1 is a **non-breaking patch** that closes the Medium + Low

@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Strategy: Naming Convention.
@@ -44,10 +45,10 @@ public final class NamingConventionStrategy implements TestDiscoveryStrategy {
     /**
      * Diagnostic accumulator: changed production FQN -> set of test FQNs
      * that matched on simple name but live in a different package. State
-     * lives on the strategy instance (not thread-local) because the
-     * engine creates exactly one strategy per run and the discovery
-     * pipeline is single-threaded; the engine picks up the map after
-     * every {@code discoverTests} call returns.
+     * lives on the strategy instance because the engine creates
+     * exactly one naming strategy per run, threads it through the
+     * impl and transitive constructors, and picks up the merged map
+     * after the discovery pass completes.
      *
      * <p>Crucially this accumulates across multiple {@code discoverTests}
      * invocations on the same instance — that's deliberate, because
@@ -55,8 +56,23 @@ public final class NamingConventionStrategy implements TestDiscoveryStrategy {
      * transitive consumers, and a cross-package over-select on a
      * transitive consumer is just as much a false positive as one on a
      * directly-changed class.
+     *
+     * <p><strong>Thread-safety (issue #42).</strong> The container is
+     * a {@link ConcurrentHashMap} keyed by changed FQN; the per-key
+     * set is built via {@link Map#computeIfAbsent} into a thread-safe
+     * view over a {@link LinkedHashSet}. The OUTER map's iteration
+     * order is intentionally not stable under parallel discovery, and
+     * neither is the per-key set's order — multiple threads (impl
+     * and transitive both call back into naming) may race to add
+     * entries. The engine pins a deterministic order at the filter
+     * boundary
+     * ({@link io.affectedtests.core.AffectedTestsEngine}{@code #filterCrossPackageMatchesToSurvivors})
+     * so the {@code --explain} hint and JSON output stay stable
+     * across runs even though the underlying accumulator is
+     * unordered.
      */
-    private final Map<String, Set<String>> crossPackageMatches = new LinkedHashMap<>();
+    private final ConcurrentHashMap<String, Set<String>> crossPackageMatches =
+            new ConcurrentHashMap<>();
 
     public NamingConventionStrategy(AffectedTestsConfig config) {
         this.config = config;
@@ -98,6 +114,17 @@ public final class NamingConventionStrategy implements TestDiscoveryStrategy {
 
     private Set<String> matchTests(Set<String> changedProductionClasses, Set<String> allTestFqns) {
         Set<String> discoveredTests = new LinkedHashSet<>();
+        // Per-call cross-package contribution. The cumulative
+        // {@code crossPackageMatches} map is shared across every
+        // {@code matchTests} invocation on this instance (impl and
+        // transitive both call back into naming). Logging the
+        // cumulative size at each call would falsely inflate the
+        // number for the second + third calls — and under parallel
+        // discovery would race with concurrent {@code .add} from
+        // other threads. We log the per-call count here and let the
+        // engine surface the aggregate via
+        // {@link #crossPackageMatches()}.
+        int crossPackageThisCall = 0;
 
         Map<String, Set<String>> expectedTestNames = new HashMap<>();
         for (String fqn : changedProductionClasses) {
@@ -130,9 +157,22 @@ public final class NamingConventionStrategy implements TestDiscoveryStrategy {
                     // diagnostic accumulator that the engine threads
                     // onto the result for --explain.
                     if (!testPackage.equals(SourceFileScanner.packageOf(changedFqn))) {
-                        crossPackageMatches
-                                .computeIfAbsent(changedFqn, k -> new LinkedHashSet<>())
-                                .add(testFqn);
+                        // Per-key set is a synchronizedSet over a
+                        // LinkedHashSet so we keep the diagnostic
+                        // ordering inside one changed FQN's matches
+                        // while remaining safe to mutate from
+                        // multiple threads. The outer map already
+                        // serialises the computeIfAbsent call so the
+                        // SET is created exactly once per key.
+                        // {@code .add} returns true on first
+                        // insertion, so we count strictly new
+                        // contributions on this call only.
+                        if (crossPackageMatches
+                                .computeIfAbsent(changedFqn,
+                                        k -> Collections.synchronizedSet(new LinkedHashSet<>()))
+                                .add(testFqn)) {
+                            crossPackageThisCall++;
+                        }
                     }
                 }
             }
@@ -140,7 +180,7 @@ public final class NamingConventionStrategy implements TestDiscoveryStrategy {
 
         log.info("[naming] Discovered {} tests for {} changed classes ({} cross-package match(es))",
                 discoveredTests.size(), changedProductionClasses.size(),
-                crossPackageMatches.values().stream().mapToInt(Set::size).sum());
+                crossPackageThisCall);
         return discoveredTests;
     }
 }

@@ -634,4 +634,55 @@ class AffectedTestsPluginTest {
                             + "in the CHANGELOG");
         }
     }
+
+    /**
+     * Issue #42 CLI flag: the typo-rejection contract on
+     * {@code -PaffectedTestsParallelDiscovery}. {@code Boolean.parseBoolean}
+     * silently returns {@code false} for typos like {@code "tru"} or
+     * {@code "flase"}, which would silently flip the kill switch in a way
+     * adopters cannot diagnose. Pin the alias set + warn-and-default
+     * behaviour so a future "simplification" that reintroduces
+     * {@code Boolean.parseBoolean} trips this test.
+     */
+    @Test
+    void parallelDiscoveryPropertyAcceptsHumanFriendlyAliases() {
+        org.gradle.api.logging.Logger log = org.gradle.api.logging.Logging
+                .getLogger(AffectedTestsPluginTest.class);
+
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("true", log));
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("True", log));
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("TRUE", log));
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("1", log));
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("on", log));
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("ON", log));
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("yes", log));
+
+        assertFalse(AffectedTestsPlugin.parseParallelDiscoveryProperty("false", log));
+        assertFalse(AffectedTestsPlugin.parseParallelDiscoveryProperty("False", log));
+        assertFalse(AffectedTestsPlugin.parseParallelDiscoveryProperty("0", log));
+        assertFalse(AffectedTestsPlugin.parseParallelDiscoveryProperty("off", log));
+        assertFalse(AffectedTestsPlugin.parseParallelDiscoveryProperty("no", log));
+    }
+
+    @Test
+    void parallelDiscoveryPropertyRejectsTyposToTheSafeDefault() {
+        org.gradle.api.logging.Logger log = org.gradle.api.logging.Logging
+                .getLogger(AffectedTestsPluginTest.class);
+
+        // Boolean.parseBoolean would silently return false for these.
+        // We default to true (parallel ON) instead — matching the
+        // canonical default in AffectedTestsConfig.Builder — so a typo
+        // never silently flips the kill switch.
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("tru", log),
+                "Typo'd 'tru' must NOT silently disable parallel — "
+                        + "fall back to the safe default (parallel ON)");
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("flase", log),
+                "Typo'd 'flase' must NOT silently disable parallel");
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("nope", log),
+                "Random invalid value must fall back to the safe default");
+        assertTrue(AffectedTestsPlugin.parseParallelDiscoveryProperty("disable", log),
+                "Common-sense-but-unsupported alias must NOT silently disable — "
+                        + "if we expand the alias set later this test will trip "
+                        + "and we'll know to update it deliberately");
+    }
 }
