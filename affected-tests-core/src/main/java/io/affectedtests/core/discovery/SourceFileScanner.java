@@ -127,10 +127,27 @@ public final class SourceFileScanner {
      * @return list of Java source files
      */
     public static List<Path> collectSourceFiles(Path projectDir, List<String> sourceDirs) {
+        return collectSourceFiles(projectDir, sourceDirs, null);
+    }
+
+    /**
+     * Same as {@link #collectSourceFiles(Path, List)}, but also records every
+     * resolved scan-root directory into {@code resolvedRoots} (when non-null) so
+     * the caller can fingerprint exactly what was walked. Used by
+     * {@code ProjectIndexCache} to drive its mtime-based validity check —
+     * without surfacing the resolved roots, the cache would have to repeat
+     * the {@code findAllMatchingDirs} expansion itself.
+     */
+    public static List<Path> collectSourceFiles(Path projectDir,
+                                                List<String> sourceDirs,
+                                                List<Path> resolvedRoots) {
         List<Path> files = new ArrayList<>();
         for (String sourceDir : sourceDirs) {
             for (Path resolved : findAllMatchingDirs(projectDir, sourceDir)) {
                 collectJavaFiles(resolved, files);
+                if (resolvedRoots != null) {
+                    resolvedRoots.add(resolved);
+                }
             }
         }
         return files;
@@ -147,10 +164,24 @@ public final class SourceFileScanner {
      * @return list of Java test files
      */
     public static List<Path> collectTestFiles(Path projectDir, List<String> testDirs) {
+        return collectTestFiles(projectDir, testDirs, null);
+    }
+
+    /**
+     * Same as {@link #collectTestFiles(Path, List)}, but also records every
+     * resolved scan-root directory into {@code resolvedRoots} (when non-null).
+     * See {@link #collectSourceFiles(Path, List, List)} for rationale.
+     */
+    public static List<Path> collectTestFiles(Path projectDir,
+                                              List<String> testDirs,
+                                              List<Path> resolvedRoots) {
         List<Path> files = new ArrayList<>();
         for (String testDir : testDirs) {
             for (Path resolved : findAllMatchingDirs(projectDir, testDir)) {
                 collectJavaFiles(resolved, files);
+                if (resolvedRoots != null) {
+                    resolvedRoots.add(resolved);
+                }
             }
         }
         return files;
