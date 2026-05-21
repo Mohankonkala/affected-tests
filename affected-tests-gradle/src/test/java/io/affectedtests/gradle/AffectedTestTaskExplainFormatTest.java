@@ -455,6 +455,122 @@ class AffectedTestTaskExplainFormatTest {
     }
 
     @Test
+    void hintFiresOnUnmappedFileWhenKotlinSourcesPresent() {
+        // Issue #47 phase 1: when the unmapped bucket contains Kotlin
+        // sources, surface the Java-only-mapping limitation explicitly
+        // rather than letting adopters discover it by deploying the
+        // plugin and watching every MR run the full suite. Keying the
+        // hint on a polyglot extension (not just any UNMAPPED_FILE
+        // run) preserves the silence regression for non-source
+        // unmapped files (build.gradle, application.yml, etc.).
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of(), Map.of(),
+                Set.of("src/main/kotlin/com/example/Foo.kt"),
+                Set.of(), Set.of(),
+                new Buckets(Set.of(), Set.of(), Set.of(), Set.of(),
+                        Set.of("src/main/kotlin/com/example/Foo.kt")),
+                true, false,
+                Situation.UNMAPPED_FILE, Action.FULL_SUITE,
+                EscalationReason.RUN_ALL_ON_NON_JAVA_CHANGE);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("Hint:"),
+                "UNMAPPED_FILE with Kotlin sources must emit the polyglot hint");
+        assertTrue(trace.contains("Kotlin"),
+                "Hint text must name Kotlin so adopters know which language is the "
+                        + "blocker without re-reading the bucket sample");
+        assertTrue(trace.contains("issues/47"),
+                "Hint must link to issue #47 so Phase 2 progress is one click away");
+    }
+
+    @Test
+    void hintFiresOnUnmappedFileWithMixedPolyglotSources() {
+        // A real-world Spring Boot + Kotlin + Groovy + Scala harness
+        // (rare but possible) lands all three extensions in the
+        // unmapped bucket. The hint must list all the languages it
+        // saw, not just the first one — otherwise the operator fixes
+        // Kotlin support, re-runs, and gets surprised by the Groovy
+        // diagnostic on the second iteration.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of(), Map.of(),
+                Set.of("src/main/kotlin/A.kt",
+                        "src/main/groovy/B.groovy",
+                        "src/main/scala/C.scala"),
+                Set.of(), Set.of(),
+                new Buckets(Set.of(), Set.of(), Set.of(), Set.of(),
+                        Set.of("src/main/kotlin/A.kt",
+                                "src/main/groovy/B.groovy",
+                                "src/main/scala/C.scala")),
+                true, false,
+                Situation.UNMAPPED_FILE, Action.FULL_SUITE,
+                EscalationReason.RUN_ALL_ON_NON_JAVA_CHANGE);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("Kotlin"), "Hint must list Kotlin");
+        assertTrue(trace.contains("Groovy"), "Hint must list Groovy");
+        assertTrue(trace.contains("Scala"),  "Hint must list Scala");
+    }
+
+    @Test
+    void hintStaysSilentOnUnmappedFileWhenOnlyGradleKotlinDslPresent() {
+        // build.gradle.kts is Kotlin-shaped but configuration-typed
+        // — firing the polyglot hint would mislead adopters into
+        // thinking the plugin can't see their production .kt files
+        // when they only have a build script. Pin the carve-out
+        // explicitly so polyglotExtensionOf can never silently start
+        // recognising .gradle.kts as a candidate again.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of(), Map.of(),
+                Set.of("build.gradle.kts"),
+                Set.of(), Set.of(),
+                new Buckets(Set.of(), Set.of(), Set.of(), Set.of(),
+                        Set.of("build.gradle.kts")),
+                true, false,
+                Situation.UNMAPPED_FILE, Action.FULL_SUITE,
+                EscalationReason.RUN_ALL_ON_NON_JAVA_CHANGE);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertFalse(trace.contains("Hint:"),
+                "Hint must stay silent — build.gradle.kts is configuration, not "
+                        + "production Kotlin source");
+    }
+
+    @Test
+    void hintFiresOnUnmappedFileWhenMixedJavaAndKotlinPresent() {
+        // Real adoption shape: an MR touches one Java config helper
+        // and one Kotlin business class. The Java file is unmapped
+        // (no .java entry in the source bucket means PathToClassMapper
+        // couldn't resolve it, e.g. it's outside any sourceDir), but
+        // the Kotlin file is the substantive cause. The hint must
+        // still fire — silencing on "any non-polyglot file present"
+        // would defeat the purpose for the most common mixed shape.
+        AffectedTestsConfig config = AffectedTestsConfig.builder().build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of(), Map.of(),
+                Set.of("scripts/legacy.java",
+                        "src/main/kotlin/com/example/Service.kt"),
+                Set.of(), Set.of(),
+                new Buckets(Set.of(), Set.of(), Set.of(), Set.of(),
+                        Set.of("scripts/legacy.java",
+                                "src/main/kotlin/com/example/Service.kt")),
+                true, false,
+                Situation.UNMAPPED_FILE, Action.FULL_SUITE,
+                EscalationReason.RUN_ALL_ON_NON_JAVA_CHANGE);
+
+        String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
+
+        assertTrue(trace.contains("Kotlin"),
+                "Hint must fire on any polyglot file in the bucket, even when other "
+                        + "non-source unmapped files are also present");
+    }
+
+    @Test
     void hintFiresOnDiscoveryEmptyFullSuiteEscalation() {
         // Positive case: when the diff changed real production code but
         // discovery found zero affected tests, the engine escalates to
