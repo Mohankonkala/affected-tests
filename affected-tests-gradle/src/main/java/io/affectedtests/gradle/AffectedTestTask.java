@@ -1497,10 +1497,16 @@ public abstract class AffectedTestTask extends DefaultTask {
      * path so an operator doesn't silently accept a partial selection.
      * The other four situations ({@link Situation#EMPTY_DIFF},
      * {@link Situation#ALL_FILES_IGNORED},
-     * {@link Situation#ALL_FILES_OUT_OF_SCOPE},
-     * {@link Situation#UNMAPPED_FILE}) reach their outcome for reasons
-     * none of these hints can usefully add to — so we stay silent and
-     * let the {@code Outcome:} line speak for itself.
+     * {@link Situation#ALL_FILES_OUT_OF_SCOPE}) reach their outcome
+     * for reasons none of these hints can usefully add to — so we
+     * stay silent and let the {@code Outcome:} line speak for itself.
+     *
+     * <p>{@link Situation#UNMAPPED_FILE} <em>does</em> get a hint as
+     * of #47: we recognise common polyglot extensions (Kotlin, Groovy,
+     * Scala) in the unmapped bucket and surface the Java-only mapping
+     * limitation explicitly, so adopters who land their first Kotlin
+     * file don't have to read the source to find out why every MR is
+     * suddenly running the full suite.
      */
     static void appendSituationHint(List<String> lines,
                                     AffectedTestsConfig config,
@@ -1532,10 +1538,11 @@ public abstract class AffectedTestTask extends DefaultTask {
             }
             case DISCOVERY_EMPTY       -> appendDiscoveryEmptyHint(lines, config, result);
             case DISCOVERY_INCOMPLETE  -> appendDiscoveryIncompleteHint(lines, result);
+            case UNMAPPED_FILE         -> appendUnmappedFileHint(lines, result);
             default                    -> {
                 // No hint for EMPTY_DIFF / ALL_FILES_IGNORED /
-                // ALL_FILES_OUT_OF_SCOPE / UNMAPPED_FILE — see
-                // method-level javadoc for the per-situation rationale.
+                // ALL_FILES_OUT_OF_SCOPE — see method-level javadoc
+                // for the per-situation rationale.
             }
         }
     }
@@ -1720,6 +1727,92 @@ public abstract class AffectedTestTask extends DefaultTask {
                     + "'full_suite' if silently skipping a partial-parse diff is "
                     + "not the intended policy.");
         }
+    }
+
+    /**
+     * Fires on {@link Situation#UNMAPPED_FILE} runs whose unmapped
+     * bucket contains files in well-known polyglot JVM extensions
+     * (Kotlin, Groovy, Scala). Surfaces the Java-only-mapping
+     * limitation as an explicit hint pointing at issue #47, so
+     * adopters who land their first Kotlin / Groovy / Scala edit
+     * don't have to read the source (or wait through a full-suite CI
+     * run on every MR for two days) to find out why selection
+     * suddenly degraded. Silent on UNMAPPED_FILE runs whose unmapped
+     * bucket is purely config / asset / yaml — those are the
+     * "expected" UNMAPPED_FILE shape and the {@code Outcome:} line
+     * already explains them.
+     */
+    private static void appendUnmappedFileHint(List<String> lines,
+                                               AffectedTestsResult result) {
+        java.util.Set<String> polyglotExts = new java.util.LinkedHashSet<>();
+        for (String path : result.buckets().unmappedFiles()) {
+            String ext = polyglotExtensionOf(path);
+            if (ext != null) {
+                polyglotExts.add(ext);
+            }
+        }
+        if (polyglotExts.isEmpty()) {
+            return;
+        }
+        // Map raw extensions to user-facing language names so the
+        // hint reads like a sentence rather than a glob list. The
+        // ordering follows decreasing real-world frequency (Kotlin
+        // first — Spring Boot + Kotlin is by far the most common
+        // mixed-source shape we'll see this hint fire on).
+        java.util.Map<String, String> displayNames = new java.util.LinkedHashMap<>();
+        displayNames.put(".kt",     "Kotlin");
+        displayNames.put(".kts",    "Kotlin");
+        displayNames.put(".groovy", "Groovy");
+        displayNames.put(".gvy",    "Groovy");
+        displayNames.put(".scala",  "Scala");
+        displayNames.put(".sc",     "Scala");
+        java.util.Set<String> langs = new java.util.LinkedHashSet<>();
+        for (String ext : polyglotExts) {
+            String name = displayNames.get(ext);
+            if (name != null) {
+                langs.add(name);
+            }
+        }
+        if (langs.isEmpty()) {
+            return;
+        }
+        String langList = String.join(" / ", langs);
+        lines.add("Hint:            the unmapped bucket includes "
+                + langList + " sources — the plugin currently maps only");
+        lines.add("                 .java, so any " + langList + " edit falls through "
+                + "to UNMAPPED_FILE and");
+        lines.add("                 escalates to FULL_SUITE under the ci / strict "
+                + "profiles. Tracking issue:");
+        lines.add("                 https://github.com/vedanthvdev/affected-tests/issues/47");
+    }
+
+    /**
+     * Returns the lowercased polyglot extension (e.g. {@code .kt})
+     * for paths whose extension matches a known JVM-language file
+     * shape, or {@code null} for everything else (including
+     * {@code .java}, {@code .yml}, {@code .properties}, etc.).
+     * Centralised here so the JSON renderer and tests share the
+     * same classifier without copy-pasting the suffix list.
+     *
+     * <p>Gradle Kotlin DSL build scripts ({@code build.gradle.kts},
+     * {@code settings.gradle.kts}) are deliberately excluded: they
+     * are Kotlin syntactically but configuration files semantically,
+     * and firing the "your Kotlin sources are unmapped" hint when
+     * the only Kotlin file in the diff is {@code build.gradle.kts}
+     * would be misleading (it is unmapped because no strategy maps
+     * build scripts, not because of the .kt-file gap issue #47
+     * tracks).
+     */
+    private static String polyglotExtensionOf(String path) {
+        String lower = path.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".gradle.kts")) return null;
+        if (lower.endsWith(".kt"))     return ".kt";
+        if (lower.endsWith(".kts"))    return ".kts";
+        if (lower.endsWith(".groovy")) return ".groovy";
+        if (lower.endsWith(".gvy"))    return ".gvy";
+        if (lower.endsWith(".scala"))  return ".scala";
+        if (lower.endsWith(".sc"))     return ".sc";
+        return null;
     }
 
     private static String formatInlineList(List<String> items) {

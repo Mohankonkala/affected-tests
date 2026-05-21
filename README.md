@@ -355,6 +355,13 @@ affectedTests {
 
 The pipeline is five stages: **detect** what changed, **bucket** each path (ignored / out-of-scope / production / test / unmapped), **resolve** the `Situation`, **discover** the tests impacted by the in-scope Java classes, and **execute** only that subset — or the full suite, or nothing at all — based on the `Action` the `Situation` maps to.
 
+### Known limitations
+
+- **Java-only mapping.** The plugin only recognises `.java` source files. Any `.kt`, `.kts`, `.groovy`, or `.scala` change in the diff falls through to the `unmapped` bucket and — under the default `ci` / `strict` profiles — escalates to `FULL_SUITE` via `UNMAPPED_FILE`. Polyglot Spring Boot + Kotlin shapes therefore see zero selection win until per-language support lands. Tracking issue: [#47](https://github.com/vedanthvdev/affected-tests/issues/47).
+  - Workaround for "Java production + Kotlin tests" repos that want partial value: route the Kotlin test files into `outOfScopeTestDirs` so a Kotlin-only edit lands in `ALL_FILES_OUT_OF_SCOPE` (`SKIPPED`) instead of escalating; combine with a separate Gradle task that runs the Kotlin tests unconditionally on every MR.
+- **Gradle 9.3+ only.** The published plugin is built against the current Gradle wrapper (currently 9.5.1) and requires Java 21+ on the classpath. Older Gradle versions are not supported.
+- **In-process git read.** Diff resolution uses JGit reading the working-tree `.git` directory directly. Bare repos, alternate worktrees that don't have their own `.git/objects`, and shallow clones with the base ref outside the fetched history are not supported — the engine logs a JGit error and escalates to `FULL_SUITE`.
+
 <p align="center">
   <img src="docs/architecture.svg" alt="Affected Tests v2 architecture: git diff feeds PathToClassMapper which buckets each changed file as ignored, out-of-scope, production Java, test Java, or unmapped; the resulting Situation (EMPTY_DIFF, ALL_FILES_IGNORED, ALL_FILES_OUT_OF_SCOPE, UNMAPPED_FILE, DISCOVERY_EMPTY, DISCOVERY_SUCCESS) maps to an Action (SELECTED, FULL_SUITE, SKIPPED) resolved in priority order from explicit onXxx settings, legacy booleans, mode defaults, and pre-v2 hardcoded defaults" width="100%">
 </p>
