@@ -63,6 +63,62 @@ Action matrix (situation → action [source]):
 === end --explain ===
 ```
 
+#### JSON output for dashboards / telemetry
+
+```bash
+./gradlew affectedTest --explain --explain-format=json
+```
+
+Emits the same decision trace as a single-line JSON object on `lifecycle()` instead of the human-readable text block. Designed for dashboard / telemetry pipelines that previously had to regex-parse the text trace and broke whenever the trace shape evolved.
+
+Schema (carried in the `version` field; new fields will be added additively while `version` stays at `1`):
+
+```json
+{
+  "version": 1,
+  "baseRef": "origin/master",
+  "mode": {"configured": "AUTO", "effective": "LOCAL"},
+  "changedFiles": 3,
+  "buckets": {"ignored": 1, "outOfScope": 0, "production": 1, "test": 0, "unmapped": 1},
+  "samples": {
+    "ignored": ["README.md"],
+    "production": ["src/main/java/com/example/Foo.java"],
+    "unmapped": ["build.gradle"]
+  },
+  "situation": "UNMAPPED_FILE",
+  "action": {"name": "FULL_SUITE", "source": "MODE_DEFAULT"},
+  "outcome": {"kind": "FULL_SUITE", "selectedClassCount": 0, "escalationReason": "RUN_ALL_ON_NON_JAVA_CHANGE"},
+  "modules": [],
+  "actionMatrix": {
+    "EMPTY_DIFF":              {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
+    "ALL_FILES_IGNORED":       {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
+    "ALL_FILES_OUT_OF_SCOPE":  {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
+    "UNMAPPED_FILE":           {"action": "FULL_SUITE", "source": "MODE_DEFAULT"},
+    "DISCOVERY_INCOMPLETE":    {"action": "SELECTED",   "source": "MODE_DEFAULT"},
+    "DISCOVERY_EMPTY":         {"action": "SKIPPED",    "source": "MODE_DEFAULT"},
+    "DISCOVERY_SUCCESS":       {"action": "SELECTED",   "source": "EXPLICIT"}
+  }
+}
+```
+
+Field-by-field semantics:
+
+| Field | Type | Notes |
+|---|---|---|
+| `version` | int | Schema version. Future additions stay within this version as long as field names + types don't change. |
+| `baseRef` | string | The git ref the diff was computed against. |
+| `mode` | object | `configured` is what the DSL declared (`AUTO` / `LOCAL` / `CI` / `STRICT`); `effective` is what `AUTO` resolved to on this run. |
+| `changedFiles` | int | Total diff size across every bucket. |
+| `buckets` | object | Five fixed integer counts: `ignored`, `outOfScope`, `production`, `test`, `unmapped`. |
+| `samples` | object | Per-bucket file samples (sorted, capped at 10 entries — same cap the text trace uses). Empty buckets are omitted from this object; compare each sample's length against the corresponding `buckets[X]` count to detect truncation. |
+| `situation` | string | One of the seven `Situation` enum values. |
+| `action` | object | `name` is one of `SELECTED` / `FULL_SUITE` / `SKIPPED`; `source` says which configuration tier resolved it (`MODE_DEFAULT` / `EXPLICIT`). |
+| `outcome` | object | `kind` mirrors `action.name`; `selectedClassCount` is meaningful on `SELECTED` runs (and `0` elsewhere); `escalationReason` is the same enum the text trace renders in the `Outcome:` line. |
+| `modules` | array | One entry per dispatched `:module:test` task (empty on non-`SELECTED` runs). Each entry carries the canonical task path and the full FQN list — no truncation, since this is the actionable downstream-routing surface. |
+| `actionMatrix` | object | Every `Situation` enum value maps to its `{action, source}` pair. Pinned in tests so a future engine that adds a situation also has to update the JSON renderer. |
+
+The text format remains the default — JSON is opt-in. Switching format never invalidates a Gradle cached execution because `--explain-format` only changes lifecycle logging, never the set of tests Gradle would actually run.
+
 That's it. With zero config, the plugin will:
 
 - Diff against `origin/master` (including uncommitted + staged changes).
