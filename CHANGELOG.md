@@ -6,6 +6,53 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — persistent per-file ProjectIndex cache, stage 2 (issue #41)
+
+Stage 1 of issue #41 (PR #78) added a persistent
+`build/affected-tests/index/v1/snapshot.tsv` so the path-derived
+aggregates — source-file list, test-file list, FQN→path index — survive
+between `affectedTest` invocations. That covered the directory-walk
+phase. The follow-up Stage 2 lifts the AST phase out of the per-run cost
+too.
+
+The four discovery strategies (naming, usage, impl, transitive) used to
+re-parse every test (and, on the impl/transitive side, every production
+source) on every invocation, even when the file's bytes hadn't changed.
+That cost scaled with the size of the suite, not with the diff. Stage 2
+distils each `CompilationUnit` into a serialisable `FileMetadata` record
+once — package name, primary type name, imports (with `static` /
+`asterisk` flags preserved), simple- and dotted-name type references,
+and per-type-declaration supertype simple names — and persists those
+records into the same snapshot under a new `m` line type. The schema
+version bumps to `2`; readers of the old `v1` format invalidate cleanly
+and fall back to a full rebuild.
+
+Invalidation is per-file, not per-snapshot: each `m` row carries the
+source file's `(mtime, size)` fingerprint, so on the next run the cache
+hands metadata back for every file whose fingerprint matches and lets
+the lazy `FileMetadataExtractor` re-parse only the files that actually
+changed. The directory-level `(mtime, child-count)` check from Stage 1
+still gates the upstream snapshot, so a brand-new file appearing under
+a tracked dir still forces a full rebuild — only edits to existing files
+are eligible for partial reuse.
+
+Foo-service warm-run discovery wall time on an unchanged tree, with the
+Gradle daemon hot, sampled with `affectedTest --explain` (10 runs per
+version, median):
+
+```
+2.2.13-alpha (no cache)         ~3.4s
+2.2.14-alpha (Stage 1 only)     ~2.2s
+2.2.16 with Stage 2             ~1.2s   (≈45% faster than Stage 1)
+```
+
+The kill switch is unchanged from Stage 1:
+`-Daffected-tests.indexCache.enabled=false` short-circuits both load
+and persist, and `rm -rf build/affected-tests/index` is the obvious
+on-disk reset. Strategies fall through to live `JavaParser` extraction
+on a row-level miss, so a corrupt or truncated `m` row degrades to a
+single re-parse rather than a full-rebuild penalty.
+
 ### Added — engine-level parallel discovery (issue #42)
 
 The four discovery strategies (naming, usage, impl, transitive) now

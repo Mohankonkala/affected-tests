@@ -2,8 +2,6 @@ package io.affectedtests.core.discovery;
 
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.ImportDeclaration;
-import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import io.affectedtests.core.config.AffectedTestsConfig;
 import io.affectedtests.core.util.LogSanitizer;
 import org.slf4j.Logger;
@@ -35,10 +33,11 @@ import java.util.*;
  *       importing it (cucumber steps, generated code, etc.).</li>
  * </ol>
  *
- * <p>Tiers&nbsp;1b/2/3 all need to know which simple names and which dotted
- * scoped names appear as type references anywhere in the AST. Both sets are
- * built lazily in a single pass over {@code ClassOrInterfaceType} nodes and
- * shared across the three tiers — see {@link UsageStrategy.AstReferences}.
+ * <p>All four tiers consume the strategy-agnostic {@link FileMetadata}
+ * record produced by {@link FileMetadataExtractor} — imports, type-ref
+ * simple/dotted names, and the declared package. Per-file extraction is
+ * a single AST pass; on a warm run {@link ProjectIndexCache} stage&nbsp;2
+ * (issue&nbsp;#41) hands back the cached record without parsing.
  */
 public final class UsageStrategy implements TestDiscoveryStrategy {
 
@@ -89,15 +88,15 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         JavaParser fallbackParser = (index == null) ? JavaParsers.newParser() : null;
 
         for (Path testFile : testFiles) {
-            CompilationUnit cu = parseOrGet(testFile, index, fallbackParser);
-            if (cu == null) continue;
+            FileMetadata md = metadataOrGet(testFile, index, fallbackParser);
+            if (md == null) continue;
 
-            String testFqn = extractFqn(cu, testFile);
+            String testFqn = extractFqn(md, testFile);
             if (testFqn == null) continue;
 
             if (changedFqns.contains(testFqn)) continue;
 
-            if (testReferencesChangedClass(cu, changedFqns, simpleNames, simpleNameToFqns)) {
+            if (testReferencesChangedClass(md, changedFqns, simpleNames, simpleNameToFqns)) {
                 discoveredTests.add(testFqn);
                 log.debug("Usage match: {}", LogSanitizer.sanitize(testFqn));
             }
@@ -108,31 +107,40 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         return discoveredTests;
     }
 
-    private CompilationUnit parseOrGet(Path file, ProjectIndex index, JavaParser fallbackParser) {
+    /**
+     * Resolves the {@link FileMetadata} for {@code file}.
+     * <p>Index-backed path (the engine-level run) returns the cached
+     * record from {@link ProjectIndex#fileMetadata(Path)} — Stage&nbsp;2
+     * of issue&nbsp;#41 lets that succeed without parsing on a warm run.
+     * <p>Standalone path (unit tests + the legacy
+     * {@code projectDir}-based entry point) parses with {@code fallbackParser}
+     * and runs the extractor inline; it pays the parse cost every time
+     * but keeps the strategy independent from {@link ProjectIndex} for
+     * tests that don't want the index plumbing.
+     */
+    private FileMetadata metadataOrGet(Path file, ProjectIndex index, JavaParser fallbackParser) {
         if (index != null) {
-            return index.compilationUnit(file);
+            return index.fileMetadata(file);
         }
-        return JavaParsers.parseOrWarn(fallbackParser, file, "usage");
+        CompilationUnit cu = JavaParsers.parseOrWarn(fallbackParser, file, "usage");
+        return cu == null ? null : FileMetadataExtractor.extract(cu);
     }
 
     /**
-     * Checks whether a test compilation unit references any of the changed classes.
-     * Tiered, with the cheapest tier first:
+     * Checks whether a test file references any of the changed classes,
+     * driven entirely off the cached {@link FileMetadata} so a warm run
+     * reads zero AST nodes.
+     *
+     * <p>Tiered with the cheapest tier first:
      *
      * <ol>
      *   <li><strong>Tier 1 — direct import match</strong>: pure scan of the
-     *       compilation unit's import list. No AST walk, no allocation per
+     *       cached import list. No type-ref iteration, no allocation per
      *       changed class.</li>
-     *   <li><strong>Tier 1b/2/3</strong>: any of these need to know which
-     *       simple names and which dotted scoped names appear as type
-     *       references anywhere in the AST. Both sets are built lazily in a
-     *       single {@link CompilationUnit#findAll(Class)} walk over
-     *       {@link ClassOrInterfaceType} — {@link AstReferences#of(CompilationUnit)}.
-     *       Pre-this-refactor the same information was rebuilt by up to
-     *       five separate AST walks per file (four inside the now-removed
-     *       {@code typeNameAppearsInAst} helper, plus one explicit walk in
-     *       Tier&nbsp;3); on a typical service that's a 3–5× cost on the
-     *       hot path.</li>
+     *   <li><strong>Tier 1b/2/3</strong>: read pre-built type-reference
+     *       sets from the metadata record. Pre-stage-2 each tier walked
+     *       the AST itself; the extractor now folds those walks into a
+     *       single pass that runs only on a cache miss.</li>
      * </ol>
      *
      * <p>All {@code changedFqn} and {@code imported} values flowing into the
@@ -143,17 +151,17 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
      * DEBUG because operators bumping level to chase a false-positive
      * selection is exactly when forgery-resistance matters most.
      */
-    private boolean testReferencesChangedClass(CompilationUnit cu,
+    private boolean testReferencesChangedClass(FileMetadata md,
                                                Set<String> changedFqns,
                                                Set<String> simpleNames,
                                                Map<String, Set<String>> simpleNameToFqns) {
         Set<String> importedFqns = new HashSet<>();
         Set<String> wildcardPackages = new HashSet<>();
-        for (ImportDeclaration imp : cu.getImports()) {
-            String name = imp.getNameAsString();
+        for (FileMetadata.Import imp : md.imports()) {
+            String name = imp.name();
             if (imp.isStatic()) {
-                // Static imports are member-scoped, not type-scoped. The name
-                // reported by JavaParser for `import static a.b.C.MAX;` is
+                // Static imports are member-scoped, not type-scoped. The
+                // name reported by JavaParser for `import static a.b.C.MAX;` is
                 // `a.b.C.MAX` and for `import static a.b.C.*;` is `a.b.C`
                 // (with isAsterisk=true). The thing a test actually depends
                 // on in both cases is the class `a.b.C`, so we normalise
@@ -193,10 +201,8 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             }
         }
 
-        // Single AST walk shared by Tier 1b, Tier 2, and Tier 3. Built lazily
-        // so a file that resolves on Tier 1 (the common case for tests with
-        // explicit imports) never pays for the walk.
-        AstReferences refs = AstReferences.of(cu);
+        Set<String> typeRefSimpleNames = md.typeRefSimpleNames();
+        Set<String> typeRefDottedNames = md.typeRefDottedNames();
 
         // Tier 1b: Wildcard import match. Two shapes have to be handled:
         //
@@ -221,7 +227,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             String pkg = SourceFileScanner.packageOf(changedFqn);
             if (wildcardPackages.contains(pkg)) {
                 String simpleName = SourceFileScanner.simpleClassName(changedFqn);
-                if (refs.simpleNames.contains(simpleName)) {
+                if (typeRefSimpleNames.contains(simpleName)) {
                     log.debug("  Wildcard package import + type ref match: {}",
                             LogSanitizer.sanitize(changedFqn));
                     return true;
@@ -230,14 +236,12 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         }
 
         // Tier 2: Same-package (no import needed).
-        String testPackage = cu.getPackageDeclaration()
-                .map(pd -> pd.getNameAsString())
-                .orElse("");
+        String testPackage = md.packageName();
         for (String changedFqn : changedFqns) {
             String changedPkg = SourceFileScanner.packageOf(changedFqn);
             if (testPackage.equals(changedPkg)) {
                 String simpleName = SourceFileScanner.simpleClassName(changedFqn);
-                if (refs.simpleNames.contains(simpleName)) {
+                if (typeRefSimpleNames.contains(simpleName)) {
                     log.debug("  Same-package type ref match: {}",
                             LogSanitizer.sanitize(changedFqn));
                     return true;
@@ -254,7 +258,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         // class at a use site. The bare-name case is already handled by
         // Tier 1 / 1b / 2; the dotted set is filtered to dotted entries only
         // to avoid double-counting.
-        for (String scoped : refs.dottedNames) {
+        for (String scoped : typeRefDottedNames) {
             for (String changedFqn : changedFqns) {
                 if (scoped.equals(changedFqn) || scoped.startsWith(changedFqn + ".")) {
                     log.debug("  Inline fully-qualified reference: {} -> {}",
@@ -266,70 +270,6 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         }
 
         return false;
-    }
-
-    /**
-     * Snapshot of every type reference in a compilation unit, in the two
-     * shapes the tiered matcher needs:
-     *
-     * <ul>
-     *   <li>{@link #simpleNames} — the unqualified leaf name of every
-     *       {@link ClassOrInterfaceType} node (e.g. both {@code List} and
-     *       {@code Foo} for source {@code List<Foo>}, both {@code Outer}
-     *       and {@code Inner} for source {@code Outer.Inner}). Used by
-     *       Tier&nbsp;1b and Tier&nbsp;2 for membership checks against
-     *       changed-class simple names.</li>
-     *   <li>{@link #dottedNames} — the {@code getNameWithScope()} string of
-     *       every type node whose result is a dotted form (i.e. has at
-     *       least one {@code .}). Used by Tier&nbsp;3 to match
-     *       fully-qualified inline references.</li>
-     * </ul>
-     *
-     * <p>Both sets are built in a single {@code findAll(ClassOrInterfaceType.class)}
-     * walk. Walking once and indexing replaces the previous shape, where
-     * the same information was implicitly rebuilt by repeated AST walks
-     * (one per changed-class match attempt × per file). The hot path
-     * — {@code testReferencesChangedClass} called per test file × per
-     * changed class — drops from O(walk × matches) to O(walk + matches).
-     */
-    private static final class AstReferences {
-        final Set<String> simpleNames;
-        final Set<String> dottedNames;
-
-        private AstReferences(Set<String> simpleNames, Set<String> dottedNames) {
-            this.simpleNames = simpleNames;
-            this.dottedNames = dottedNames;
-        }
-
-        static AstReferences of(CompilationUnit cu) {
-            Set<String> simpleNames = new HashSet<>();
-            Set<String> dottedNames = new HashSet<>();
-            for (ClassOrInterfaceType type : cu.findAll(ClassOrInterfaceType.class)) {
-                simpleNames.add(type.getNameAsString());
-                String scoped = nameWithScopeOrNull(type);
-                if (scoped != null && scoped.indexOf('.') >= 0) {
-                    dottedNames.add(scoped);
-                }
-            }
-            return new AstReferences(simpleNames, dottedNames);
-        }
-    }
-
-    /**
-     * Returns the dotted name of {@code type} including its enclosing
-     * scope chain, or {@code null} when JavaParser throws while
-     * reconstructing it (e.g. a partially-resolved type node in an
-     * invalid source file). Isolating the guard here means the caller
-     * never has to defensively wrap the AST walk — a best-effort null
-     * is enough to skip a single type node while the rest of the file
-     * still contributes to discovery.
-     */
-    private static String nameWithScopeOrNull(ClassOrInterfaceType type) {
-        try {
-            return type.getNameWithScope();
-        } catch (RuntimeException e) {
-            return null;
-        }
     }
 
     /**
@@ -346,7 +286,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         return name.substring(0, idx);
     }
 
-    private String extractFqn(CompilationUnit cu, Path testFile) {
+    private String extractFqn(FileMetadata md, Path testFile) {
         for (String testDir : config.testDirs()) {
             Path testRoot = SourceFileScanner.findTestRoot(testFile, testDir);
             if (testRoot != null) {
@@ -361,11 +301,9 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
             }
         }
 
-        String pkg = cu.getPackageDeclaration()
-                .map(pd -> pd.getNameAsString())
-                .orElse("");
-        return cu.getPrimaryTypeName()
-                .map(name -> pkg.isEmpty() ? name : pkg + "." + name)
-                .orElse(null);
+        String pkg = md.packageName();
+        String primary = md.primaryTypeName();
+        if (primary == null) return null;
+        return pkg.isEmpty() ? primary : pkg + "." + primary;
     }
 }

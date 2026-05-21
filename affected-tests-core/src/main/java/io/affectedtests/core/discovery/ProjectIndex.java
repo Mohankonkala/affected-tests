@@ -7,7 +7,10 @@ import io.affectedtests.core.mapping.OutOfScopeMatchers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -39,6 +42,17 @@ public final class ProjectIndex {
     private final Set<String> sourceFqns;
 
     /**
+     * Scan-root paths captured at {@link #build(Path, AffectedTestsConfig) build}
+     * time so {@link ProjectIndexCache} can re-fingerprint exactly what
+     * was walked when persisting at end of run (Stage&nbsp;2 of
+     * issue&nbsp;#41). On a Stage&nbsp;1 cache hit
+     * {@link ProjectIndexCache} reconstructs this from the cached
+     * dir-snapshot rows so the persist path stays uniform across
+     * hit / miss.
+     */
+    private final ProjectIndexCache.ScannedDirs scannedDirs;
+
+    /**
      * Lazy AST cache. Holds {@code Optional.empty()} for paths that
      * parseOrWarn returned null for, since {@link ConcurrentHashMap}
      * disallows null values. Switching to {@link ConcurrentHashMap}
@@ -50,6 +64,62 @@ public final class ProjectIndex {
      */
     private final ConcurrentHashMap<Path, Optional<CompilationUnit>> cuCache =
             new ConcurrentHashMap<>();
+
+    /**
+     * Strategy-facing per-file derived data (issue&nbsp;#41 stage&nbsp;2).
+     * Holds {@code Optional.empty()} for paths that failed to parse so
+     * the same retry-and-fail behaviour as {@link #cuCache} is preserved
+     * (and so {@link ConcurrentHashMap}'s null-value prohibition doesn't
+     * collapse a failure into a recompute loop).
+     *
+     * <p>On a cache hit the snapshot pre-populates this map directly from
+     * disk via {@link #seedFileMetadata(Path, FileMetadata, long, long)}
+     * so strategies never touch the parser. On a miss (or for a file
+     * whose fingerprint changed since the snapshot) the entry is
+     * populated lazily through {@link #fileMetadata(Path)} via
+     * {@link FileMetadataExtractor}.
+     *
+     * <p>Each entry carries the {@code (mtime, size)} fingerprint that
+     * was captured immediately after the parse / at seed time (see
+     * {@link CachedMetadata}) so the end-of-run persist can write it
+     * back without re-statting every file. Capturing at extract time
+     * also collapses the TOCTOU window: if a user edits the file
+     * mid-run, the persisted fingerprint corresponds (within
+     * microseconds) to the content we actually parsed, instead of to
+     * the post-edit state which would silently match a stale cache
+     * row on the next run.
+     */
+    private final ConcurrentHashMap<Path, Optional<CachedMetadata>> metadataCache =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Cached {@link FileMetadata} bundled with the {@code (mtime, size)}
+     * fingerprint of the source file as observed at the moment the
+     * record was produced. Lazy-extract path captures the fingerprint
+     * via {@link Files#readAttributes} immediately after the
+     * {@link CompilationUnit} parse succeeds; cache-hit-seed path
+     * inherits the fingerprint from the on-disk row that already
+     * verified against the live file. End-of-run persist writes the
+     * carried fingerprint directly — no second {@link Files#readAttributes}
+     * pass — which both halves the per-file syscall count and binds
+     * each persisted row to the file version we actually consumed.
+     *
+     * <p>{@link #UNKNOWN_FINGERPRINT} marks an entry whose fingerprint
+     * could not be captured (the {@link Files#readAttributes} call
+     * after a successful parse threw). Such entries serve strategy
+     * lookups normally but are excluded from the persist snapshot —
+     * a row with no verifiable fingerprint would either be invalidated
+     * on every subsequent load (best case) or silently survive past
+     * a real change (worst case), and either outcome is worse than
+     * paying one re-extract on the next run.
+     */
+    record CachedMetadata(FileMetadata metadata, long mtime, long size) {
+        static final long UNKNOWN_FINGERPRINT = -1L;
+
+        boolean hasFingerprint() {
+            return mtime != UNKNOWN_FINGERPRINT && size != UNKNOWN_FINGERPRINT;
+        }
+    }
 
     /**
      * Per-thread parser. JavaParser instances are not safe to share
@@ -99,11 +169,13 @@ public final class ProjectIndex {
     private final AtomicInteger parseFailureCount = new AtomicInteger();
 
     private ProjectIndex(List<Path> sourceFiles, List<Path> testFiles,
-                         Map<String, Path> testFqnToPath, Set<String> sourceFqns) {
+                         Map<String, Path> testFqnToPath, Set<String> sourceFqns,
+                         ProjectIndexCache.ScannedDirs scannedDirs) {
         this.sourceFiles = sourceFiles;
         this.testFiles = testFiles;
         this.testFqnToPath = testFqnToPath;
         this.sourceFqns = sourceFqns;
+        this.scannedDirs = scannedDirs;
     }
 
     public static ProjectIndex build(Path projectDir, AffectedTestsConfig config) {
@@ -182,16 +254,18 @@ public final class ProjectIndex {
                 sourceFiles.size(), testFiles.size(), sourceFqns.size(), testFqnToPath.size(),
                 config.outOfScopeSourceDirs().size(), config.outOfScopeTestDirs().size());
 
+        ProjectIndexCache.ScannedDirs dirs =
+                new ProjectIndexCache.ScannedDirs(sourceRoots, testRoots);
         ProjectIndex index = new ProjectIndex(
                 Collections.unmodifiableList(sourceFiles),
                 Collections.unmodifiableList(testFiles),
                 Collections.unmodifiableMap(testFqnToPath),
-                Collections.unmodifiableSet(sourceFqns)
+                Collections.unmodifiableSet(sourceFqns),
+                dirs
         );
 
         if (Boolean.parseBoolean(System.getProperty("affected-tests.indexCache.enabled", "true"))) {
-            ProjectIndexCache.persist(projectDir, config, index,
-                    new ProjectIndexCache.ScannedDirs(sourceRoots, testRoots));
+            ProjectIndexCache.persist(projectDir, config, index, dirs);
         }
         return index;
     }
@@ -208,13 +282,26 @@ public final class ProjectIndex {
     static ProjectIndex fromCache(List<Path> sourceFiles,
                                   List<Path> testFiles,
                                   LinkedHashMap<String, Path> testFqnToPath,
-                                  Set<String> sourceFqns) {
+                                  Set<String> sourceFqns,
+                                  ProjectIndexCache.ScannedDirs scannedDirs) {
         return new ProjectIndex(
                 Collections.unmodifiableList(sourceFiles),
                 Collections.unmodifiableList(testFiles),
                 Collections.unmodifiableMap(testFqnToPath),
-                Collections.unmodifiableSet(sourceFqns)
+                Collections.unmodifiableSet(sourceFqns),
+                scannedDirs
         );
+    }
+
+    /**
+     * Returns the scan-root paths captured when this index was built.
+     * Used by {@link ProjectIndexCache} for end-of-run persistence so
+     * Stage&nbsp;2 metadata can be written without re-resolving the
+     * {@code sourceDirs} / {@code testDirs} glob shapes a second time.
+     * Package-private — no external consumer.
+     */
+    ProjectIndexCache.ScannedDirs scannedDirs() {
+        return scannedDirs;
     }
 
     private static List<Path> filterOutOfScope(List<Path> files, Path projectDir,
@@ -283,6 +370,127 @@ public final class ProjectIndex {
             return Optional.ofNullable(cu);
         });
         return entry.orElse(null);
+    }
+
+    /**
+     * Returns the strategy-relevant per-file derived data — package,
+     * imports, type-reference simple/dotted names, type declarations
+     * with their supertype simple names — for {@code file}. Returns
+     * {@code null} when the file failed to parse and no cached metadata
+     * is available, mirroring the {@link #compilationUnit(Path)} null
+     * contract so strategies can keep their existing {@code if (md == null) continue;}
+     * skip pattern.
+     *
+     * <p>Issue&nbsp;#41 stage&nbsp;2 hot path. On a Stage&nbsp;2 cache
+     * hit the snapshot has already seeded {@link #metadataCache}
+     * directly from disk for every fingerprint-matching file, so
+     * strategy reads cost a single map lookup. On a miss (or for a
+     * file whose {@code (mtime, size)} fingerprint drifted) the lazy
+     * load extracts metadata from the freshly-parsed
+     * {@link CompilationUnit} via {@link FileMetadataExtractor}, and
+     * the resulting record is shareable across the discovery thread
+     * pool because {@link FileMetadata} is immutable.
+     *
+     * <p>The compilation unit obtained in the miss path is itself
+     * cached by {@link #compilationUnit(Path)}, so a strategy that
+     * still wants the raw AST for some future feature can pay only
+     * the parse cost once — not once per consumer.
+     */
+    public FileMetadata fileMetadata(Path file) {
+        Optional<CachedMetadata> entry = metadataCache.computeIfAbsent(file, key -> {
+            CompilationUnit cu = compilationUnit(key);
+            if (cu == null) {
+                return Optional.empty();
+            }
+            FileMetadata md = FileMetadataExtractor.extract(cu);
+            // Capture the source file's (mtime, size) fingerprint
+            // immediately after the parse so the persisted row reflects
+            // the file version we actually consumed. The TOCTOU window
+            // shrinks to a few microseconds — small enough that an
+            // editor-save-during-discovery race is now bounded by the
+            // OS scheduler rather than by "until end of engine run".
+            // An IO failure here keeps the metadata usable for this
+            // run but marks the entry unfit for persist (see
+            // {@link #metadataCacheSnapshot()}); the alternative —
+            // writing a row whose fingerprint we can't justify — is
+            // strictly worse for cache correctness.
+            long mtime;
+            long size;
+            try {
+                BasicFileAttributes attrs = Files.readAttributes(key, BasicFileAttributes.class);
+                mtime = attrs.lastModifiedTime().toMillis();
+                size = attrs.size();
+            } catch (IOException ioe) {
+                mtime = CachedMetadata.UNKNOWN_FINGERPRINT;
+                size = CachedMetadata.UNKNOWN_FINGERPRINT;
+            }
+            return Optional.of(new CachedMetadata(md, mtime, size));
+        });
+        return entry.map(CachedMetadata::metadata).orElse(null);
+    }
+
+    /**
+     * Pre-populates the metadata cache for {@code file} from the
+     * persistent snapshot — the cache hit path. Call this exactly once
+     * per fingerprint-matching cached file before strategies fan out;
+     * any later {@link #fileMetadata(Path)} call short-circuits to the
+     * pre-seeded entry without touching JavaParser.
+     *
+     * <p>Carries the {@code (mtime, size)} fingerprint forward from
+     * the on-disk row so end-of-run persist can re-emit the same row
+     * without a fresh {@link Files#readAttributes} call. The seeded
+     * fingerprint already passed verification against the live file
+     * in {@link ProjectIndexCache} — re-stat would only confirm what
+     * we just confirmed.
+     *
+     * <p>Package-private because only {@link ProjectIndexCache} should
+     * be wiring cached records back into a {@code ProjectIndex}.
+     */
+    void seedFileMetadata(Path file, FileMetadata metadata, long mtime, long size) {
+        metadataCache.put(file, Optional.of(new CachedMetadata(metadata, mtime, size)));
+    }
+
+    /**
+     * Number of distinct files whose {@link FileMetadata} has been
+     * realised during this engine run, summed across snapshot-seeded
+     * entries and lazily-extracted entries. Diagnostic accessor used by
+     * Stage&nbsp;2 cache tests to assert "warm-run discovery touched
+     * the parser zero times" on an unchanged tree.
+     */
+    int fileMetadataCacheSize() {
+        return metadataCache.size();
+    }
+
+    /**
+     * Returns an unmodifiable view of every successfully-realised
+     * {@link FileMetadata} entry currently in the per-file cache that
+     * also carries a verifiable {@code (mtime, size)} fingerprint,
+     * keyed by the absolute file path. Filtered to:
+     * <ul>
+     *   <li>drop unsuccessful parses (entries holding
+     *       {@link Optional#empty()}) — persisting them is incorrect
+     *       since the next run might succeed once the source error is
+     *       fixed;</li>
+     *   <li>drop entries whose fingerprint capture failed
+     *       ({@link CachedMetadata#hasFingerprint()} is {@code false})
+     *       — a row without a verifiable fingerprint can't be safely
+     *       reused on the next run.</li>
+     * </ul>
+     *
+     * <p>Used by {@link ProjectIndexCache} stage&nbsp;2 to persist the
+     * per-file derived data at end of run. Package-private because no
+     * other consumer should be poking at the cache shape.
+     */
+    Map<Path, CachedMetadata> metadataCacheSnapshot() {
+        LinkedHashMap<Path, CachedMetadata> out = new LinkedHashMap<>();
+        for (Map.Entry<Path, Optional<CachedMetadata>> e : metadataCache.entrySet()) {
+            e.getValue().ifPresent(cm -> {
+                if (cm.hasFingerprint()) {
+                    out.put(e.getKey(), cm);
+                }
+            });
+        }
+        return Collections.unmodifiableMap(out);
     }
 
     /**

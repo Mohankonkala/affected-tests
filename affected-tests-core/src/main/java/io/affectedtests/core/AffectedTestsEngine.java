@@ -442,6 +442,18 @@ public final class AffectedTestsEngine {
         }
         DiscoveryProfile profile = runDiscovery(workItems, candidateTests, config);
 
+        // Issue #41 stage 2: re-persist the snapshot now that the
+        // strategies have populated the per-file metadata cache. On a
+        // cache-miss build this turns the previously-empty Stage 2
+        // block into a fully-populated one; on a cache-hit-then-
+        // -refresh build this writes any newly-extracted entries back
+        // (files whose fingerprint drifted since the previous run).
+        // Honours the same system-property kill switch as the
+        // build-time persist, and silently skips a no-op write when
+        // the index has no scanned-dir context (defensive — every
+        // current code path produces an index with non-null dirs).
+        ProjectIndexCache.persist(projectDir, config, index);
+
         // C2 guard: keep only FQNs whose source file still exists on disk.
         // Deleted/renamed tests (their old FQN) must not be passed to Gradle's
         // --tests flag or it will fail the whole build with "No tests found".

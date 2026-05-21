@@ -2,8 +2,6 @@ package io.affectedtests.core.discovery;
 
 import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
-import com.github.javaparser.ast.ImportDeclaration;
-import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import io.affectedtests.core.config.AffectedTestsConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -278,11 +276,11 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
                 // explicit `!resolvedFqn.equals(classFqn)` check.
                 if (targetFqnsForName.contains(candidateFqn)) continue;
 
-                CompilationUnit cu = parseOrGet(candidate, index, fallbackParser);
-                if (cu == null) continue;
+                FileMetadata md = metadataOrGet(candidate, index, fallbackParser);
+                if (md == null) continue;
 
                 Set<String> resolvedTargets = resolveReferencesToFrontier(
-                        cu, simpleName, targetFqnsForName,
+                        md, simpleName, targetFqnsForName,
                         candidateFqn, allKnownFqns);
                 if (!resolvedTargets.isEmpty()) {
                     nextLevel.add(candidateFqn);
@@ -293,13 +291,22 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
     }
 
     /**
-     * Inspects a candidate file's AST and returns the subset of
-     * {@code targetFqnsForName} that {@code candidate} actually
-     * references via {@code simpleName}. Walks {@link
-     * ClassOrInterfaceType} nodes (covers fields, method signatures,
-     * generics, method bodies, casts, {@code instanceof}, extends/
-     * implements) and resolves each via the candidate file's import
-     * map → wildcard imports → same-package fallback.
+     * Inspects a candidate file's cached {@link FileMetadata} and
+     * returns the subset of {@code targetFqnsForName} that
+     * {@code candidate} actually references via {@code simpleName}.
+     * The metadata's type-ref simple-name set replaces the old
+     * {@code findAll(ClassOrInterfaceType.class)} walk: the
+     * resolution itself does not depend on which AST node mentions
+     * the simple name (every reference resolves to the same FQN
+     * given the same import map / wildcard list / current package),
+     * so a single membership check is equivalent to walking every
+     * type-ref node.
+     *
+     * <p>Static imports are deliberately excluded from the import
+     * map — they're member-scoped, not type-scoped, and cannot
+     * produce reverse-dependency edges. Usage normalises them
+     * differently because direct-import matching there cares about
+     * the owning class FQN; Transitive does not have that need.
      *
      * <p>Returning the resolved set rather than a boolean lets the
      * caller (and future diagnostics) tell which exact frontier FQN
@@ -308,41 +315,39 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
      * shape costs nothing and avoids pre-emptively narrowing the
      * helper's contract.
      */
-    private Set<String> resolveReferencesToFrontier(CompilationUnit cu,
+    private Set<String> resolveReferencesToFrontier(FileMetadata md,
                                                     String simpleName,
                                                     Set<String> targetFqnsForName,
                                                     String candidateFqn,
                                                     Set<String> allKnownFqns) {
         Set<String> hits = new LinkedHashSet<>();
 
+        if (!md.typeRefSimpleNames().contains(simpleName)) {
+            return hits;
+        }
+
         Map<String, String> importMap = new HashMap<>();
         Set<String> wildcardPackages = new HashSet<>();
-        for (ImportDeclaration imp : cu.getImports()) {
-            if (imp.isAsterisk()) {
-                wildcardPackages.add(imp.getNameAsString());
-            } else {
-                String impFqn = imp.getNameAsString();
-                importMap.put(SourceFileScanner.simpleClassName(impFqn), impFqn);
-            }
-        }
-        String currentPackage = cu.getPackageDeclaration()
-                .map(pd -> pd.getNameAsString())
-                .orElse("");
-
-        for (ClassOrInterfaceType t : cu.findAll(ClassOrInterfaceType.class)) {
-            if (!simpleName.equals(t.getNameAsString())) {
+        for (FileMetadata.Import imp : md.imports()) {
+            if (imp.isStatic()) {
                 continue;
             }
-            String resolvedFqn = resolveSimpleName(
-                    simpleName, importMap, wildcardPackages,
-                    currentPackage, allKnownFqns);
-            if (resolvedFqn == null) continue;
-            if (resolvedFqn.equals(candidateFqn)) continue;
-            if (targetFqnsForName.contains(resolvedFqn)) {
-                hits.add(resolvedFqn);
-                // No early-return: we collect every frontier FQN this
-                // file resolves to, so the caller has full information.
+            String name = imp.name();
+            if (imp.isAsterisk()) {
+                wildcardPackages.add(name);
+            } else {
+                importMap.put(SourceFileScanner.simpleClassName(name), name);
             }
+        }
+        String currentPackage = md.packageName();
+
+        String resolvedFqn = resolveSimpleName(
+                simpleName, importMap, wildcardPackages,
+                currentPackage, allKnownFqns);
+        if (resolvedFqn == null) return hits;
+        if (resolvedFqn.equals(candidateFqn)) return hits;
+        if (targetFqnsForName.contains(resolvedFqn)) {
+            hits.add(resolvedFqn);
         }
         return hits;
     }
@@ -378,11 +383,12 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
         return null;
     }
 
-    private CompilationUnit parseOrGet(Path file, ProjectIndex index, JavaParser fallbackParser) {
+    private FileMetadata metadataOrGet(Path file, ProjectIndex index, JavaParser fallbackParser) {
         if (index != null) {
-            return index.compilationUnit(file);
+            return index.fileMetadata(file);
         }
-        return JavaParsers.parseOrWarn(fallbackParser, file, "transitive");
+        CompilationUnit cu = JavaParsers.parseOrWarn(fallbackParser, file, "transitive");
+        return cu == null ? null : FileMetadataExtractor.extract(cu);
     }
 
     private String pathToFqn(Path file) {
