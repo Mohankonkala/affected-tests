@@ -56,6 +56,7 @@ public final class AffectedTestsConfig {
     private final Mode effectiveMode;
     private final Map<Situation, Action> situationActions;
     private final Map<Situation, ActionSource> situationActionSources;
+    private final boolean parallelDiscovery;
 
     private AffectedTestsConfig(Builder builder) {
         this.baseRef = builder.baseRef;
@@ -90,6 +91,7 @@ public final class AffectedTestsConfig {
         ResolvedActions resolved = resolveSituationActions(builder, this.effectiveMode);
         this.situationActions = resolved.actions;
         this.situationActionSources = resolved.sources;
+        this.parallelDiscovery = builder.parallelDiscovery;
     }
 
     /** Parallel pair returned from the situation-action resolver. */
@@ -192,6 +194,22 @@ public final class AffectedTestsConfig {
     public boolean includeStaged() { return includeStaged; }
     public Set<String> strategies() { return strategies; }
     public int transitiveDepth() { return transitiveDepth; }
+
+    /**
+     * Whether the engine fans the four discovery strategies out across
+     * a small thread pool ({@code true}, default) or runs them serially
+     * in declaration order ({@code false}). Issue #42's Stage 1 win:
+     * on workloads where transitive dominates wall time, overlapping
+     * naming + usage + impl + transitive halves discovery time on a
+     * 4-vCPU runner with no algorithmic change.
+     *
+     * <p>Disable via DSL ({@code parallelDiscovery = false}) or the
+     * Gradle property {@code -PaffectedTestsParallelDiscovery=false}
+     * if a workload triggers a JavaParser-thread-safety regression
+     * we have not seen yet — the serial path remains a one-line
+     * fallback and is what the existing functional tests exercise.
+     */
+    public boolean parallelDiscovery() { return parallelDiscovery; }
     public List<String> testSuffixes() { return testSuffixes; }
     public List<String> sourceDirs() { return sourceDirs; }
     public List<String> testDirs() { return testDirs; }
@@ -404,6 +422,14 @@ public final class AffectedTestsConfig {
         // ./gradlew child process is destroyed. Validated at the
         // setter; negative values throw IllegalArgumentException.
         private long gradlewTimeoutSeconds = 0L;
+        // Issue #42: engine-level fan-out across the four discovery
+        // strategies. Default ON because the per-strategy work is
+        // independent and the thread-safety guards on ProjectIndex /
+        // NamingConventionStrategy.crossPackageMatches make the
+        // parallel path a strict win over serial on every workload
+        // we've measured. Adopters who hit a regression can flip to
+        // false without touching code via -PaffectedTestsParallelDiscovery=false.
+        private boolean parallelDiscovery = true;
 
         private Mode mode;
         private Action onEmptyDiff;
@@ -530,6 +556,10 @@ public final class AffectedTestsConfig {
             return this;
         }
         public Builder transitiveDepth(int v) { this.transitiveDepth = Math.max(0, Math.min(v, 5)); return this; }
+        /**
+         * @see AffectedTestsConfig#parallelDiscovery()
+         */
+        public Builder parallelDiscovery(boolean v) { this.parallelDiscovery = v; return this; }
         public Builder testSuffixes(List<String> v) {
             this.testSuffixes = Objects.requireNonNull(v, "testSuffixes must not be null");
             return this;

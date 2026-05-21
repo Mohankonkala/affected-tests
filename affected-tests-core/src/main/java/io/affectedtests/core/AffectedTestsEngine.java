@@ -13,7 +13,15 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Main orchestrator: detects changes, maps them to classes, discovers affected tests.
@@ -181,6 +189,17 @@ public final class AffectedTestsEngine {
      *                                 changing the (deliberately
      *                                 package-agnostic) selection
      *                                 policy.
+     * @param discoveryProfile         per-strategy timing / test-count
+     *                                 capture from issue #42, exposed
+     *                                 via {@code --explain} so adopters
+     *                                 can see whether parallel discovery
+     *                                 helped on their workload and which
+     *                                 strategy is the dominant
+     *                                 wall-time consumer. Defaults to
+     *                                 {@link DiscoveryProfile#empty()}
+     *                                 on engine paths that don't run
+     *                                 discovery (test-only fast path,
+     *                                 EMPTY_DIFF, etc.).
      */
     public record AffectedTestsResult(
             Set<String> testClassFqns,
@@ -194,21 +213,52 @@ public final class AffectedTestsEngine {
             Situation situation,
             Action action,
             EscalationReason escalationReason,
-            Map<String, Set<String>> namingCrossPackageMatches
+            Map<String, Set<String>> namingCrossPackageMatches,
+            DiscoveryProfile discoveryProfile
     ) {
         public AffectedTestsResult {
             namingCrossPackageMatches = namingCrossPackageMatches == null
                     ? Map.of()
                     : Collections.unmodifiableMap(namingCrossPackageMatches);
+            discoveryProfile = discoveryProfile == null
+                    ? DiscoveryProfile.empty()
+                    : discoveryProfile;
+        }
+
+        /**
+         * Backwards-compatible 12-arg constructor — preserves the
+         * pre-issue-#42 record shape every test fixture and
+         * downstream caller was written against. Defaults the
+         * {@code discoveryProfile} field to {@link DiscoveryProfile#empty()},
+         * matching what every engine path that didn't actually run
+         * discovery produces.
+         */
+        public AffectedTestsResult(
+                Set<String> testClassFqns,
+                Map<String, Path> testFqnToPath,
+                Set<String> changedFiles,
+                Set<String> changedProductionClasses,
+                Set<String> changedTestClasses,
+                Buckets buckets,
+                boolean runAll,
+                boolean skipped,
+                Situation situation,
+                Action action,
+                EscalationReason escalationReason,
+                Map<String, Set<String>> namingCrossPackageMatches
+        ) {
+            this(testClassFqns, testFqnToPath, changedFiles,
+                    changedProductionClasses, changedTestClasses,
+                    buckets, runAll, skipped, situation, action,
+                    escalationReason, namingCrossPackageMatches,
+                    DiscoveryProfile.empty());
         }
 
         /**
          * Backwards-compatible 11-arg constructor — preserves the
-         * record shape every test fixture and downstream caller was
-         * written against before issue #40 added the
-         * {@code namingCrossPackageMatches} diagnostic. Defaults the
-         * new field to {@link Map#of()}, matching what every
-         * non-DISCOVERY_SUCCESS engine path already produces.
+         * pre-issue-#40 record shape. Defaults
+         * {@code namingCrossPackageMatches} to {@link Map#of()} and
+         * {@code discoveryProfile} to {@link DiscoveryProfile#empty()}.
          */
         public AffectedTestsResult(
                 Set<String> testClassFqns,
@@ -226,7 +276,7 @@ public final class AffectedTestsEngine {
             this(testClassFqns, testFqnToPath, changedFiles,
                     changedProductionClasses, changedTestClasses,
                     buckets, runAll, skipped, situation, action,
-                    escalationReason, Map.of());
+                    escalationReason, Map.of(), DiscoveryProfile.empty());
         }
     }
 
@@ -366,19 +416,31 @@ public final class AffectedTestsEngine {
 
         ProjectIndex index = ProjectIndex.build(projectDir, config);
 
+        // Issue #42: build the list of (name, callable) work items the
+        // engine will dispatch; running them serially below or via a
+        // small thread pool above is a uniform decision rather than a
+        // four-way `if` ladder. The per-strategy capture into
+        // {@link DiscoveryProfile} lives here so the parallel path
+        // and the serial path produce the same shape of diagnostic.
+        List<DiscoveryWorkItem> workItems = new ArrayList<>(4);
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_NAMING)) {
-            candidateTests.addAll(namingStrategy.discoverTests(productionClasses, index));
+            workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_NAMING,
+                    () -> namingStrategy.discoverTests(productionClasses, index)));
         }
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_USAGE)) {
-            candidateTests.addAll(usageStrategy.discoverTests(productionClasses, index));
+            workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_USAGE,
+                    () -> usageStrategy.discoverTests(productionClasses, index)));
         }
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_IMPL)) {
-            candidateTests.addAll(implStrategy.discoverTests(productionClasses, index));
+            workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_IMPL,
+                    () -> implStrategy.discoverTests(productionClasses, index)));
         }
         if (config.strategies().contains(AffectedTestsConfig.STRATEGY_TRANSITIVE)
                 && config.transitiveDepth() > 0) {
-            candidateTests.addAll(transitiveStrategy.discoverTests(productionClasses, index));
+            workItems.add(new DiscoveryWorkItem(AffectedTestsConfig.STRATEGY_TRANSITIVE,
+                    () -> transitiveStrategy.discoverTests(productionClasses, index)));
         }
+        DiscoveryProfile profile = runDiscovery(workItems, candidateTests, config);
 
         // C2 guard: keep only FQNs whose source file still exists on disk.
         // Deleted/renamed tests (their old FQN) must not be passed to Gradle's
@@ -479,7 +541,8 @@ public final class AffectedTestsEngine {
                 finalSituation,
                 Action.SELECTED,
                 EscalationReason.NONE,
-                survivingCrossPackage
+                survivingCrossPackage,
+                profile
         );
     }
 
@@ -643,15 +706,27 @@ public final class AffectedTestsEngine {
      * would render misleadingly. Returns an empty map when nothing
      * survives, matching the {@code Map.of()} default in the no-naming
      * / no-discovery short-circuits.
+     *
+     * <p>Sorts the outer keys and inner sets alphabetically so the
+     * {@code --explain} hint and JSON output stay deterministic
+     * across runs. Issue #42 — under parallel discovery, multiple
+     * threads can populate the underlying {@link
+     * java.util.concurrent.ConcurrentHashMap} (in
+     * {@link io.affectedtests.core.discovery.NamingConventionStrategy})
+     * in races, so the raw iteration order varies between
+     * runs even on identical inputs. We pin a deterministic order
+     * here at the filter boundary rather than inside the strategy
+     * because the strategy is hot-path and the filter is cold-path
+     * (called once per engine run, post-discovery).
      */
     private static Map<String, Set<String>> filterCrossPackageMatchesToSurvivors(
             Map<String, Set<String>> raw, Set<String> survivingTests) {
         if (raw.isEmpty()) {
             return Map.of();
         }
-        Map<String, Set<String>> filtered = new LinkedHashMap<>();
+        Map<String, Set<String>> filtered = new TreeMap<>();
         for (var entry : raw.entrySet()) {
-            Set<String> survivingForKey = new LinkedHashSet<>();
+            Set<String> survivingForKey = new TreeSet<>();
             for (String testFqn : entry.getValue()) {
                 if (survivingTests.contains(testFqn)) {
                     survivingForKey.add(testFqn);
@@ -676,4 +751,205 @@ public final class AffectedTestsEngine {
             case DISCOVERY_SUCCESS -> EscalationReason.NONE;
         };
     }
+
+    // ── Issue #42: parallel discovery dispatch ─────────────────────────────
+
+    /**
+     * One unit of discovery work: a strategy name (used as the diagnostic
+     * key in {@link DiscoveryProfile}) plus the callable that produces
+     * the strategy's test-FQN result. Bundled as a record so {@link
+     * #runDiscovery} can iterate the same shape regardless of whether
+     * dispatch happens serially or via a thread pool.
+     */
+    /**
+     * Package-private so {@code AffectedTestsEngineErrorPropagationTest}
+     * can drive {@link #runDiscovery} with synthetic work items that
+     * throw deterministic exceptions, pinning the
+     * "parallel and serial unwrap the same way" contract without
+     * needing to corrupt a real project layout.
+     */
+    record DiscoveryWorkItem(String name, Callable<Set<String>> work) {}
+
+    /**
+     * Daemon factory for the discovery pool. Threads are named
+     * {@code affected-tests-discovery-N} so a {@code jstack} against a
+     * stuck Gradle daemon can attribute a parked thread back to a
+     * concrete strategy slot.
+     */
+    private static final class DaemonThreadFactory implements ThreadFactory {
+        private final AtomicInteger counter = new AtomicInteger(0);
+
+        @Override
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(r,
+                    "affected-tests-discovery-" + counter.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        }
+    }
+
+    /**
+     * Runs the supplied {@link DiscoveryWorkItem}s, accumulates results
+     * into {@code candidateTests}, and returns a {@link DiscoveryProfile}
+     * describing how dispatch actually executed (parallel vs serial,
+     * concurrency level, per-strategy timings, per-strategy contribution
+     * counts).
+     *
+     * <p>The parallel path uses a fixed {@link ExecutorService} sized to
+     * {@code min(workItems.size(), availableProcessors)} with daemon
+     * threads (so a misbehaving strategy can't keep the JVM alive past
+     * the engine run). The pool is gated on
+     * {@code availableProcessors() > 1} — on a single-vCPU host
+     * (cgroups-pinned containers, GitHub Actions free runners) the
+     * pool collapses to "serial via an executor", which is strictly
+     * slower than the in-line serial path. When there is only one
+     * work item, or {@link AffectedTestsConfig#parallelDiscovery()} is
+     * false, we skip the pool entirely — no point paying executor
+     * spin-up overhead to run a single callable.
+     *
+     * <p>Result merge order is intentionally NOT the dispatch order
+     * — the candidate set is a {@link LinkedHashSet} which keeps
+     * INSERTION order, but the discovery union is an unordered
+     * concept; downstream consumers (the on-disk filter, the
+     * dispatch loop, the {@code --explain} renderer) re-order
+     * deterministically before any user-visible output. The
+     * determinism contract is "same inputs produce the same SET",
+     * not "same inputs produce the same iteration order".
+     *
+     * <p>Note for adopters running Gradle's {@code --parallel} flag
+     * across multiple modules: each module spins up its own discovery
+     * pool. On an 8-vCPU runner with 4 modules in parallel that's
+     * potentially 16 discovery threads; the per-thread JavaParser
+     * footprint is small but the contention on the CU cache may
+     * reduce per-module speedup.
+     */
+    static DiscoveryProfile runDiscovery(List<DiscoveryWorkItem> workItems,
+                                         Set<String> candidateTests,
+                                         AffectedTestsConfig config) {
+        if (workItems.isEmpty()) {
+            return DiscoveryProfile.empty();
+        }
+        // Gate parallel on:
+        //  - flag enabled,
+        //  - more than one work item (single-callable parallelism is
+        //    strictly slower than in-line serial — pool spin-up is
+        //    pure overhead), and
+        //  - more than one vCPU (a 1-thread pool runs the same work
+        //    serially, plus pool overhead).
+        boolean runParallel = config.parallelDiscovery()
+                && workItems.size() > 1
+                && Runtime.getRuntime().availableProcessors() > 1;
+        long t0 = System.nanoTime();
+        Map<String, Duration> perStrategyWall = new LinkedHashMap<>();
+        Map<String, Integer> perStrategyTestCount = new LinkedHashMap<>();
+        // Per-strategy result containers. We hold them outside the
+        // executor block so the merge into candidateTests stays
+        // single-threaded (LinkedHashSet is not thread-safe; the merge
+        // happens AFTER all parallel work completes).
+        Map<String, Set<String>> perStrategyResult = new LinkedHashMap<>();
+
+        if (runParallel) {
+            int concurrencyLevel = Math.min(workItems.size(), Runtime.getRuntime().availableProcessors());
+            ExecutorService pool = Executors.newFixedThreadPool(
+                    concurrencyLevel, new DaemonThreadFactory());
+            try {
+                Map<String, Future<TimedResult>> futures = new LinkedHashMap<>();
+                for (DiscoveryWorkItem item : workItems) {
+                    futures.put(item.name(), pool.submit(() -> {
+                        long start = System.nanoTime();
+                        Set<String> result = item.work().call();
+                        return new TimedResult(result, System.nanoTime() - start);
+                    }));
+                }
+                // Drain every future, collecting results AND any
+                // exceptions. We don't fail-fast on the first error
+                // because a second concurrent failure (e.g. two
+                // strategies hitting a shared corruption) would
+                // otherwise stay invisible until the operator fixes
+                // #1 and re-runs. Suppress exceptions onto the first
+                // one so the stack trace surfaces every failure.
+                RuntimeException firstFailure = null;
+                for (Map.Entry<String, Future<TimedResult>> e : futures.entrySet()) {
+                    try {
+                        TimedResult tr = e.getValue().get();
+                        perStrategyResult.put(e.getKey(), tr.result());
+                        perStrategyWall.put(e.getKey(), Duration.ofNanos(tr.elapsedNanos()));
+                        perStrategyTestCount.put(e.getKey(), tr.result().size());
+                    } catch (ExecutionException ex) {
+                        // Unwrap to surface the original exception
+                        // exactly as the serial path would have — hiding
+                        // a strategy crash behind ExecutionException
+                        // would make adopter debugging materially
+                        // harder ("affectedTest failed with j.u.c.EE").
+                        // Tag with the strategy name so parallel and
+                        // serial produce the same message shape.
+                        Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                        RuntimeException wrapped = (cause instanceof RuntimeException re)
+                                ? re
+                                : new RuntimeException("Strategy " + e.getKey() + " threw", cause);
+                        if (cause instanceof Error er) {
+                            // Errors aren't recoverable; surface immediately.
+                            throw er;
+                        }
+                        if (firstFailure == null) {
+                            firstFailure = wrapped;
+                        } else {
+                            firstFailure.addSuppressed(wrapped);
+                        }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Discovery interrupted", ie);
+                    }
+                }
+                if (firstFailure != null) {
+                    throw firstFailure;
+                }
+            } finally {
+                // shutdown() rather than shutdownNow(): every future
+                // has already been .get()'d in the loop above on the
+                // happy path, so there is no in-flight work to cancel.
+                // On the failure path we've drained every future too
+                // (the suppressed-exception accumulator runs the loop
+                // to completion). shutdown() expresses intent
+                // accurately; shutdownNow() reads as "I have
+                // outstanding work to interrupt" which we don't.
+                pool.shutdown();
+            }
+            for (Set<String> r : perStrategyResult.values()) {
+                candidateTests.addAll(r);
+            }
+            Duration total = Duration.ofNanos(System.nanoTime() - t0);
+            log.info("[discovery] parallel ({} threads) completed in {} ms; per-strategy: {}",
+                    concurrencyLevel, total.toMillis(), perStrategyWall);
+            return new DiscoveryProfile(true, concurrencyLevel, total,
+                    perStrategyWall, perStrategyTestCount);
+        }
+
+        // Serial fallback: keeps the single-strategy and disabled-flag
+        // paths cheap, and gives us a baseline to A/B against in
+        // perf tests (toggle config.parallelDiscovery and the same
+        // engine code runs each path).
+        for (DiscoveryWorkItem item : workItems) {
+            long start = System.nanoTime();
+            Set<String> result;
+            try {
+                result = item.work().call();
+            } catch (RuntimeException re) {
+                throw re;
+            } catch (Exception ex) {
+                throw new RuntimeException("Strategy " + item.name() + " threw", ex);
+            }
+            perStrategyResult.put(item.name(), result);
+            perStrategyWall.put(item.name(), Duration.ofNanos(System.nanoTime() - start));
+            perStrategyTestCount.put(item.name(), result.size());
+            candidateTests.addAll(result);
+        }
+        Duration total = Duration.ofNanos(System.nanoTime() - t0);
+        log.info("[discovery] serial completed in {} ms; per-strategy: {}",
+                total.toMillis(), perStrategyWall);
+        return new DiscoveryProfile(false, 0, total, perStrategyWall, perStrategyTestCount);
+    }
+
+    /** Internal carrier for "strategy result + how long it took to compute". */
+    private record TimedResult(Set<String> result, long elapsedNanos) {}
 }

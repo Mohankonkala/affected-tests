@@ -4,11 +4,13 @@ import org.gradle.api.GradleException;
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
 import org.gradle.api.file.Directory;
+import org.gradle.api.logging.Logger;
 import org.gradle.api.tasks.TaskProvider;
 
 import java.io.File;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
 
@@ -75,6 +77,30 @@ public class AffectedTestsPlugin implements Plugin<Project> {
         // the core {@code AffectedTestsConfig.Builder.DEFAULT_IGNORE_PATHS}.
         extension.getIncludeImplementationTests().convention(true);
         extension.getImplementationNaming().convention(List.of("Impl", "Default"));
+        // Mirror the baseRef / mode pattern: let callers flip the
+        // engine-level discovery dispatch from serial to parallel (or
+        // back) without editing build.gradle, via
+        // {@code -PaffectedTestsParallelDiscovery=false}. The property
+        // name follows the existing {@code affectedTests*} camelCase
+        // convention used by every other override
+        // ({@code affectedTestsBaseRef}, {@code affectedTestsMode},
+        // …). The adopter-facing kill switch is documented on
+        // {@link io.affectedtests.core.config.AffectedTestsConfig#parallelDiscovery()}.
+        //
+        // We accept a small set of human-friendly aliases (true/false,
+        // 1/0, on/off, yes/no, case-insensitive) and emit a build-log
+        // WARN for anything else — {@code Boolean.parseBoolean}
+        // silently returns {@code false} for typos like "tru" or
+        // "flase", which would silently flip the kill switch in a way
+        // adopters cannot diagnose.
+        Logger pluginLog = project.getLogger();
+        extension.getParallelDiscovery().convention(
+                project.getProviders().gradleProperty("affectedTestsParallelDiscovery")
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .map(raw -> parseParallelDiscoveryProperty(raw, pluginLog))
+                        .orElse(true)
+        );
 
         Project rootProject = project.getRootProject();
         Directory rootDir = rootProject.getLayout().getProjectDirectory();
@@ -97,6 +123,7 @@ public class AffectedTestsPlugin implements Plugin<Project> {
             task.getOutOfScopeSourceDirs().set(extension.getOutOfScopeSourceDirs());
             task.getIncludeImplementationTests().set(extension.getIncludeImplementationTests());
             task.getImplementationNaming().set(extension.getImplementationNaming());
+            task.getParallelDiscovery().set(extension.getParallelDiscovery());
             task.getMode().set(extension.getMode());
             task.getOnEmptyDiff().set(extension.getOnEmptyDiff());
             task.getOnAllFilesIgnored().set(extension.getOnAllFilesIgnored());
@@ -246,5 +273,35 @@ public class AffectedTestsPlugin implements Plugin<Project> {
             return "";
         }
         return relative.replace(File.separatorChar, '/');
+    }
+
+    /**
+     * Parses the {@code -PaffectedTestsParallelDiscovery} property
+     * value, accepting a small set of human-friendly aliases and
+     * warning on anything else.
+     *
+     * <p>{@link Boolean#parseBoolean(String)} is unsuitable here:
+     * it returns {@code false} for every non-{@code "true"} input,
+     * which means typos like {@code "tru"} or {@code "flase"}
+     * silently flip the kill switch in a way the adopter cannot
+     * diagnose. This helper rejects unknown values to a default
+     * of {@code true} (matching {@link
+     * io.affectedtests.core.config.AffectedTestsConfig.Builder}'s
+     * canonical default) and emits a build-log WARN naming the bad
+     * value so the operator notices.
+     *
+     * <p>Package-private for unit-test reach.
+     */
+    static boolean parseParallelDiscoveryProperty(String raw, Logger log) {
+        return switch (raw.toLowerCase(Locale.ROOT)) {
+            case "true", "1", "on", "yes" -> true;
+            case "false", "0", "off", "no" -> false;
+            default -> {
+                log.warn("Affected Tests: ignoring -PaffectedTestsParallelDiscovery='{}'; "
+                        + "expected one of true|false|1|0|on|off|yes|no. "
+                        + "Falling back to the default (parallel discovery ON).", raw);
+                yield true;
+            }
+        };
     }
 }

@@ -317,6 +317,18 @@ affectedTests {
     // (default: 4, max: 5, 0 = disabled)
     transitiveDepth = 4
 
+    // Engine-level parallel discovery (issue #42). Fans the four discovery
+    // strategies out across a small thread pool sized to
+    // min(strategies, availableProcessors); collapses to in-line serial on
+    // single-vCPU hosts where the pool would just add overhead. Default
+    // true; flip to false (or pass `-PaffectedTestsParallelDiscovery=false`)
+    // if a workload ever needs the serial path back. The `--explain` trace
+    // prints a per-strategy breakdown
+    // ("Discovery: parallel (4 threads, 12ms total)") so adopters can see
+    // whether parallel actually helped on their workload and which
+    // strategy is the wall-time hog.
+    parallelDiscovery = true
+
     // Test class suffixes (default: ["Test", "IT", "ITTest", "IntegrationTest"])
     testSuffixes = ["Test", "IT", "ITTest", "IntegrationTest"]
 

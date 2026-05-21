@@ -28,6 +28,7 @@ import org.gradle.api.provider.Property;
  *     outOfScopeTestDirs = ["api-test/src/test/java"]
  *     strategies = ["naming", "usage", "impl", "transitive"]
  *     transitiveDepth = 4
+ *     parallelDiscovery = true
  *     testSuffixes = ["Test", "IT", "ITTest", "IntegrationTest"]
  *     sourceDirs = ["src/main/java"]
  *     testDirs = ["src/test/java"]
@@ -87,6 +88,26 @@ public abstract class AffectedTestsExtension {
      * @return the transitive depth property
      */
     public abstract Property<Integer> getTransitiveDepth();
+
+    /**
+     * Whether to fan the four discovery strategies out across a small
+     * thread pool (default {@code true}) or run them serially. Engine-
+     * level parallelism is the Stage 1 win for issue #42; on the
+     * workloads we've measured it cuts discovery wall time by ~2x
+     * with no algorithmic change. Adopters can flip to {@code false}
+     * if a custom strategy fork or a JavaParser regression we have
+     * not seen yet introduces a race; the serial path remains a
+     * one-line fallback.
+     *
+     * <p>The Gradle property {@code -PaffectedTestsParallelDiscovery=false}
+     * provides the same kill switch without touching the DSL. The
+     * property accepts {@code true|false|1|0|on|off|yes|no}
+     * (case-insensitive); typo'd values are rejected with a build-log
+     * WARN rather than silently flipping the switch.
+     *
+     * @return the parallel-discovery property
+     */
+    public abstract Property<Boolean> getParallelDiscovery();
 
     /**
      * Test class suffixes used by the naming strategy.

@@ -57,9 +57,12 @@ class AffectedTestTaskExplainJsonFormatTest {
 
         String json = AffectedTestTask.renderExplainJson(config, result, Map.of());
 
-        assertTrue(json.contains("\"version\":1"),
-                "Schema version must be present and pinned at v1 — "
-                        + "consumers need it to detect future additions. Got: " + json);
+        assertTrue(json.contains("\"version\":2"),
+                "Schema version must be present and pinned at v2 — "
+                        + "issue #42 bumped from v1 to add the additive "
+                        + "discovery block; all v1 fields remain present. "
+                        + "Consumers need the version to detect future "
+                        + "additions. Got: " + json);
         assertTrue(json.contains("\"baseRef\":\"origin/master\""),
                 "Base ref must be carried so dashboards can correlate "
                         + "traces against the right merge target. Got: " + json);
@@ -264,6 +267,74 @@ class AffectedTestTaskExplainJsonFormatTest {
         assertTrue(ex.getMessage().contains("'text'") && ex.getMessage().contains("'json'"),
                 "Error must list the supported values so the operator "
                         + "doesn't have to read the source. Got: " + ex.getMessage());
+    }
+
+    @Test
+    void jsonAddsDiscoveryBlockWithParallelMetadataAndPerStrategyArray() {
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .baseRef("origin/master").mode(Mode.LOCAL).build();
+        Buckets buckets = new Buckets(Set.of(), Set.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of(), Set.of());
+        io.affectedtests.core.discovery.DiscoveryProfile profile =
+                new io.affectedtests.core.discovery.DiscoveryProfile(
+                        true, 4,
+                        java.time.Duration.ofMillis(13),
+                        java.util.Map.of(
+                                "naming",     java.time.Duration.ofMillis(2),
+                                "transitive", java.time.Duration.ofMillis(11)),
+                        java.util.Map.of("naming", 2, "transitive", 3));
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of("com.example.FooTest"), Map.of(),
+                Set.of("src/main/java/com/example/Foo.java"),
+                Set.of("com.example.Foo"), Set.of(),
+                buckets,
+                false, false,
+                Situation.DISCOVERY_SUCCESS, Action.SELECTED,
+                EscalationReason.NONE,
+                Map.of(),
+                profile);
+
+        String json = AffectedTestTask.renderExplainJson(config, result, Map.of());
+
+        assertTrue(json.contains("\"discovery\":{\"parallelEnabled\":true,\"concurrencyLevel\":4"),
+                "Discovery block must carry parallelEnabled (boolean) and "
+                        + "concurrencyLevel (number). Got: " + json);
+        assertTrue(json.contains("\"totalMillis\":13"),
+                "Total wall time must be present so dashboards can chart "
+                        + "discovery latency over time. Got: " + json);
+        assertTrue(json.contains("\"perStrategy\":["),
+                "Per-strategy array must be a JSON array (not an object) "
+                        + "so consumers can iterate without converting key "
+                        + "ordering across runs. Got: " + json);
+        assertTrue(json.contains("\"name\":\"naming\",\"millis\":2,\"tests\":2"),
+                "Per-strategy entry must carry name + ms + test count. Got: " + json);
+    }
+
+    @Test
+    void jsonDiscoveryBlockIsAlwaysPresentEvenOnEmptyProfile() {
+        // Total schema: a consumer iterating .discovery.perStrategy
+        // must not have to null-check the discovery field on
+        // empty-diff runs. We always emit it; an empty profile
+        // shows up as an empty array — never absent.
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .baseRef("origin/master").mode(Mode.LOCAL).build();
+        AffectedTestsResult result = new AffectedTestsResult(
+                Set.of(), Map.of(),
+                Set.of(), Set.of(), Set.of(),
+                Buckets.empty(),
+                false, true,
+                Situation.EMPTY_DIFF, Action.SKIPPED,
+                EscalationReason.NONE);
+
+        String json = AffectedTestTask.renderExplainJson(config, result, Map.of());
+
+        assertTrue(json.contains("\"discovery\":{\"parallelEnabled\":false,\"concurrencyLevel\":0"),
+                "Empty-profile JSON must still carry the discovery block "
+                        + "with default-zero values. Got: " + json);
+        assertTrue(json.contains("\"perStrategy\":[]"),
+                "Empty-profile perStrategy must be an empty array, not absent. "
+                        + "Got: " + json);
     }
 
     @Test
