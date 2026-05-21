@@ -397,6 +397,10 @@ The plugin scans the project tree **recursively at any depth** to find source an
 
 Directories like `.git`, `build`, `.gradle`, and `node_modules` are automatically skipped during the walk. `outOfScopeTestDirs` and `outOfScopeSourceDirs` are additionally filtered at index time so discovery never picks up tests living there.
 
+### Persistent discovery cache
+
+Every `affectedTest` run caches its index — directory structure, file lists, FQN→path map, and the per-file AST data the strategies actually consume — into `build/affected-tests/index/v1/snapshot.tsv`, so a subsequent run on the same tree skips the scan and AST work and only re-parses files whose `(mtime, size)` fingerprint changed. Disable with `-Daffected-tests.indexCache.enabled=false` or `rm -rf build/affected-tests/index` to force a rebuild.
+
 ### Source-set auto-discovery
 
 When the consumer applies the Java plugin (or anything that derives from `java-base`), the plugin walks each subproject's `JavaPluginExtension` source sets at `gradle.projectsEvaluated` time and seeds `sourceDirs` / `testDirs` from the live source-set graph. A source set is classified as a **test source set** when a `Test`-typed Gradle task points at its `output.classesDirs` — the same convention `JvmTestSuitePlugin` uses. Everything else falls into `sourceDirs` (the production bucket), including helper / fixture source sets that are consumed by tests at compile time but have no Test task of their own.

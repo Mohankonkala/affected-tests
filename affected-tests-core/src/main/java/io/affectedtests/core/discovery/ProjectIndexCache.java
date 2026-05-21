@@ -39,15 +39,22 @@ import java.util.Set;
  * invocation, and there is no persistence — two consecutive runs
  * against an unchanged source tree do the same work twice.
  *
- * <p>Stage 1 (this class) caches the four index aggregates:
+ * <p>Stage 1 caches four path-derived index aggregates:
  * <ul>
  *   <li>{@code sourceFiles} — absolute paths of every {@code .java} file under {@code sourceDirs}</li>
  *   <li>{@code testFiles} — absolute paths of every {@code .java} file under {@code testDirs}</li>
  *   <li>{@code testFqnToPath} — ordered map of test FQN to its file</li>
  *   <li>{@code sourceFqns} — set of production FQNs</li>
  * </ul>
- * Per-file derived AST data (imports, simple-name refs, supertypes) is
- * deliberately out of scope for Stage 1 — that is a follow-up.
+ *
+ * <p>Stage 2 ({@code SCHEMA_VERSION = 2}) caches per-file
+ * AST-derived data — declared package, primary type, imports, type-ref
+ * simple/dotted names, and per-decl supertype names — captured as
+ * {@link FileMetadata} records so {@link UsageStrategy},
+ * {@link ImplementationStrategy}, and {@link TransitiveStrategy} can
+ * read them without re-parsing on a warm run. Each row carries a
+ * {@code (mtime, size)} fingerprint so a single edited file
+ * invalidates only its own row, not the whole snapshot.
  *
  * <p>Cache file layout: line-based TSV at {@code
  * <projectDir>/build/affected-tests/index/v1/snapshot.tsv}. Hand-rolled
@@ -85,28 +92,62 @@ import java.util.Set;
  * rebuild — partial-cache reuse is intentionally NOT supported in
  * Stage 1 to keep the safety contract trivial to reason about.
  *
- * <p><strong>What the cache deliberately does NOT verify.</strong>
- * Per-file mtimes for {@code .java} content edits do not need to
- * invalidate the Stage 1 cache, because every aggregate it stores is
- * path-derived (FQN comes from relativising the file path against its
- * source root, not from parsing the {@code package} declaration). A
- * vim save inside an existing file will not change the dir mtime,
- * leaves the file list unchanged, and is therefore correctly served
- * from the cache. When Stage 2 (AST-derived data) lands, that layer
- * will need its own per-file fingerprint.
+ * <p><strong>What the dir contract deliberately does NOT verify.</strong>
+ * Per-file mtimes for {@code .java} content edits do not affect the
+ * Stage 1 aggregates, because those are all path-derived (FQN comes
+ * from relativising the file path against its source root, not from
+ * parsing the {@code package} declaration). A vim save inside an
+ * existing file does not change the dir mtime and leaves the file
+ * list unchanged, so Stage 1 happily reuses the aggregates. Stage 2
+ * (AST-derived data) carries its own per-file {@code (mtime, size)}
+ * fingerprint and skips a row whose fingerprint drifted, so a content
+ * edit forces the affected file to re-extract while every other
+ * file's record stays valid.
  */
 public final class ProjectIndexCache {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectIndexCache.class);
 
     /** Version of the on-disk format. Bumped when any line shape changes incompatibly. */
-    static final int SCHEMA_VERSION = 1;
+    static final int SCHEMA_VERSION = 2;
 
     private static final String CACHE_DIR_REL = "build/affected-tests/index/v1";
     private static final String SNAPSHOT_FILE = "snapshot.tsv";
 
     /** TSV separator. Tabs are vanishingly rare in source-tree paths and make hand-debugging trivial. */
     private static final char SEP = '\t';
+
+    /**
+     * Inner separator for list fields inside a per-file metadata
+     * row ({@code m} type — see {@link Snapshot#read} for the
+     * line-type dispatch). Pipe is not legal in any Java identifier,
+     * package name, FQN, or path component on POSIX, so it splits
+     * cleanly without escaping. Tabs are reserved for the outer
+     * TSV layer.
+     */
+    private static final char LIST_SEP = '|';
+
+    /**
+     * Inner separator inside a single import entry: {@code name:flag}.
+     * Colons are illegal in Java type names and import targets, so
+     * they unambiguously separate the import name from its kind flag
+     * inside the pipe-delimited list.
+     */
+    private static final char IMPORT_KIND_SEP = ':';
+
+    /**
+     * Inner separator between a type-declaration's simple name and
+     * its supertype list inside the per-decl row: {@code name=sup1,sup2}.
+     * Equals is not legal in Java identifiers.
+     */
+    private static final char DECL_SEP = '=';
+
+    /**
+     * Inner separator inside a supertype list: {@code sup1,sup2,sup3}.
+     * Comma is not legal in identifiers; the list is empty for
+     * declarations with no extends/implements clause.
+     */
+    private static final char SUPER_SEP = ',';
 
     private ProjectIndexCache() {}
 
@@ -161,18 +202,103 @@ public final class ProjectIndexCache {
         if (!verifyDirs(loaded.dirSnapshots)) {
             return Optional.empty();
         }
-        log.info("ProjectIndex cache HIT: {} source files, {} test files, {} test FQNs, {} source FQNs",
+        ProjectIndex index = materialise(loaded);
+        int metadataSeeded = seedFileMetadata(index, loaded.fileMetadataRows);
+        log.info("ProjectIndex cache HIT: {} source files, {} test files, {} test FQNs, {} source FQNs"
+                        + " (per-file metadata seeded: {} of {})",
                 loaded.sourceFiles.size(), loaded.testFiles.size(),
-                loaded.testFqnToPath.size(), loaded.sourceFqns.size());
-        return Optional.of(materialise(loaded));
+                loaded.testFqnToPath.size(), loaded.sourceFqns.size(),
+                metadataSeeded, loaded.fileMetadataRows.size());
+        return Optional.of(index);
     }
 
     /**
-     * Persists a freshly-built {@link ProjectIndex} for re-use on the next run.
-     * Failures here are intentionally non-fatal: a project that cannot write under
-     * {@code build/} (read-only mount, permission gap, full disk) should still
-     * succeed at the {@code affectedTest} task itself — caching is a perf win, not
+     * Walks the cached per-file metadata rows, validates each one's
+     * {@code (mtime, size)} fingerprint against the live file, and
+     * pre-seeds {@link ProjectIndex#seedFileMetadata(Path, FileMetadata)}
+     * for every match. A fingerprint mismatch (or a vanished file) is
+     * a row-level miss: the row is skipped and the strategy that later
+     * consults that file falls through to {@link FileMetadataExtractor}
+     * via the lazy parse path. The other files' rows stay valid.
+     *
+     * <p>Returns the count of successfully-seeded entries so the load
+     * log can surface "I reused N of M rows" for diagnostics. Rows
+     * dropped on fingerprint mismatch are not logged individually —
+     * they're noisy on large repos and the count is the
+     * actionable signal.
+     */
+    private static int seedFileMetadata(ProjectIndex index, List<FileMetadataRow> rows) {
+        int seeded = 0;
+        for (FileMetadataRow row : rows) {
+            Path path;
+            try {
+                path = Path.of(row.path);
+            } catch (java.nio.file.InvalidPathException ipe) {
+                // A garbled `m` row that survived FileMetadataRow.parse
+                // (path field non-empty but not a syntactically-valid
+                // path on this platform) shouldn't break load — skip
+                // the row and let the rest of the snapshot seed.
+                continue;
+            }
+            long currentMtime;
+            long currentSize;
+            try {
+                BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class);
+                currentMtime = attrs.lastModifiedTime().toMillis();
+                currentSize = attrs.size();
+            } catch (IOException e) {
+                continue;
+            }
+            if (currentMtime != row.mtime || currentSize != row.size) {
+                continue;
+            }
+            // Forward the row's verified (mtime, size) so end-of-run
+            // persist can re-emit the same fingerprint without a
+            // second readAttributes call — the fingerprint we just
+            // matched is exactly the one we'd capture again.
+            index.seedFileMetadata(path, row.metadata, row.mtime, row.size);
+            seeded++;
+        }
+        return seeded;
+    }
+
+    /**
+     * Persists the {@link ProjectIndex} for re-use on the next run.
+     * Reads the {@link ScannedDirs} from {@code index.scannedDirs()} —
+     * the index carries them through both the cache-miss and cache-hit
+     * paths so end-of-run persistence is uniform.
+     *
+     * <p>Honours the {@code affected-tests.indexCache.enabled} system
+     * property (defaulting on); a {@code false} value short-circuits
+     * the write so a debug run can't influence later enabled runs.
+     *
+     * <p>Failures here are intentionally non-fatal: a project that
+     * cannot write under {@code build/} (read-only mount, permission
+     * gap, full disk) should still succeed at the
+     * {@code affectedTest} task itself — caching is a perf win, not
      * a correctness requirement.
+     */
+    public static void persist(Path projectDir,
+                               AffectedTestsConfig config,
+                               ProjectIndex index) {
+        if (!Boolean.parseBoolean(System.getProperty("affected-tests.indexCache.enabled", "true"))) {
+            return;
+        }
+        ScannedDirs dirs = index.scannedDirs();
+        if (dirs == null) {
+            return;
+        }
+        persist(projectDir, config, index, dirs);
+    }
+
+    /**
+     * Lower-level overload used by {@link ProjectIndex#build} to
+     * persist immediately on a cache miss with whatever metadata
+     * exists at that moment (initially empty Stage&nbsp;2 block;
+     * strategies populate it later and the engine re-persists at end
+     * of run). Public so existing call sites and tests can supply
+     * {@link ScannedDirs} explicitly without depending on
+     * {@code index.scannedDirs()} being non-null.
      */
     public static void persist(Path projectDir,
                                AffectedTestsConfig config,
@@ -180,13 +306,21 @@ public final class ProjectIndexCache {
                                ScannedDirs dirs) {
         Path cacheDir = projectDir.resolve(CACHE_DIR_REL);
         Path snapshot = cacheDir.resolve(SNAPSHOT_FILE);
+        // Per-writer unique tmp filename: PID + nanoTime makes simultaneous
+        // persists from two affectedTest invocations on the same checkout
+        // (parallel CI matrix, two terminals) write into disjoint staging
+        // files instead of clobbering each other on the shared
+        // SNAPSHOT_FILE + ".tmp" path. The atomic-rename target is still
+        // shared (only one of the racers will land on disk), but neither
+        // racer's write can corrupt the other's in-flight stream.
+        Path tmp = cacheDir.resolve(SNAPSHOT_FILE
+                + ".tmp." + ProcessHandle.current().pid()
+                + "." + Long.toHexString(System.nanoTime()));
         try {
             Files.createDirectories(cacheDir);
-            // Atomic-ish write: stage to a sibling tmp file then move into
-            // place, so a partial write (or a concurrent affectedTest run
-            // racing the same write) cannot leave the cache half-written
-            // and trip the next reader.
-            Path tmp = cacheDir.resolve(SNAPSHOT_FILE + ".tmp");
+            // Atomic-ish write: stage to the unique tmp file then move
+            // into place, so a partial write cannot leave the cache
+            // half-written and trip the next reader.
             try (BufferedWriter writer = Files.newBufferedWriter(tmp, StandardCharsets.UTF_8)) {
                 Snapshot.write(writer, configHash(config), dirs, index);
             }
@@ -205,6 +339,18 @@ public final class ProjectIndexCache {
             log.warn("ProjectIndex cache: failed to persist snapshot at {}: {} — next run will rebuild",
                     LogSanitizer.sanitize(snapshot.toString()),
                     LogSanitizer.sanitize(e.getMessage()));
+        } finally {
+            // Best-effort cleanup of the per-writer tmp file. On the happy
+            // path the rename above moved it; on a write failure (disk
+            // full, permission gap, OOM mid-serialise) the file is still
+            // sitting there. Leaving it leaks build/-tree garbage and
+            // makes a `du` against build/affected-tests/ misleading.
+            try {
+                Files.deleteIfExists(tmp);
+            } catch (IOException ignored) {
+                // Already best-effort; a failed cleanup of a failed write
+                // is not worth a second log line.
+            }
         }
     }
 
@@ -387,7 +533,26 @@ public final class ProjectIndexCache {
             testFqnToPath.put(e.getKey(), Path.of(e.getValue()));
         }
         Set<String> sourceFqns = new LinkedHashSet<>(s.sourceFqns);
-        return ProjectIndex.fromCache(sourceFiles, testFiles, testFqnToPath, sourceFqns);
+
+        // Reconstruct ScannedDirs from the cached d-rows. The original
+        // build distinguished sourceRoots / testRoots, but the on-disk
+        // shape collapses both into a single d-row scanRoot field —
+        // and downstream {@code persist} only iterates the union to
+        // re-walk subtrees, so packing every reconstructed root into
+        // sourceRoots and leaving testRoots empty produces the same
+        // walk. The split exists for the original-build call site's
+        // ergonomics, not for an on-disk invariant.
+        Set<String> uniqueRootStrings = new LinkedHashSet<>();
+        for (DirSnapshot d : s.dirSnapshots) {
+            uniqueRootStrings.add(d.scanRoot);
+        }
+        List<Path> reconstructedRoots = new ArrayList<>(uniqueRootStrings.size());
+        for (String root : uniqueRootStrings) {
+            reconstructedRoots.add(Path.of(root));
+        }
+        ScannedDirs dirs = new ScannedDirs(reconstructedRoots, List.of());
+
+        return ProjectIndex.fromCache(sourceFiles, testFiles, testFqnToPath, sourceFqns, dirs);
     }
 
     // ── On-disk schema ──────────────────────────────────────────────────
@@ -405,6 +570,14 @@ public final class ProjectIndexCache {
         List<String> testFiles = new ArrayList<>();
         LinkedHashMap<String, String> testFqnToPath = new LinkedHashMap<>();
         List<String> sourceFqns = new ArrayList<>();
+
+        /**
+         * Stage&nbsp;2 (issue&nbsp;#41) per-file metadata rows. Each row
+         * carries a {@code (path, mtime, size)} fingerprint so a single
+         * edited file invalidates only its own row and the rest of the
+         * cache stays usable.
+         */
+        List<FileMetadataRow> fileMetadataRows = new ArrayList<>();
 
         static Snapshot read(BufferedReader reader) throws IOException {
             Snapshot s = new Snapshot();
@@ -429,6 +602,10 @@ public final class ProjectIndexCache {
                         }
                     }
                     case "sfqn"  -> s.sourceFqns.add(rest);
+                    case "m"     -> {
+                        FileMetadataRow row = FileMetadataRow.parse(rest);
+                        if (row != null) s.fileMetadataRows.add(row);
+                    }
                     default      -> { /* forward-compat: ignore unknown line type */ }
                 }
             }
@@ -471,6 +648,33 @@ public final class ProjectIndexCache {
                 writer.write("sfqn" + SEP + fqn);
                 writer.newLine();
             }
+            // Stage 2: per-file metadata rows. Pulled from the index
+            // at write time — on a cache-miss build this is whatever
+            // strategies extracted lazily, on a cache-hit-then-rebuild
+            // path it's the union of seeded entries plus any
+            // refreshed-on-fingerprint-mismatch entries. Each entry
+            // already carries the (mtime, size) captured at extract
+            // time (lazy path) or inherited from the verified on-disk
+            // row (seed path); persist re-emits that fingerprint
+            // directly. Two wins: no second {@link Files#readAttributes}
+            // call per cached file (halves the per-file syscall budget
+            // on large repos), and the persisted fingerprint binds
+            // the row to the file version we actually parsed instead
+            // of to whatever the file looked like at the moment the
+            // engine returned (TOCTOU narrowing).
+            //
+            // Entries whose fingerprint capture failed at extract time
+            // are filtered out by {@link ProjectIndex#metadataCacheSnapshot()}
+            // before reaching this loop — a row without a verifiable
+            // fingerprint would silently survive past a real change
+            // and is strictly worse than re-extracting next run.
+            Map<Path, ProjectIndex.CachedMetadata> liveMetadata = index.metadataCacheSnapshot();
+            for (Map.Entry<Path, ProjectIndex.CachedMetadata> e : liveMetadata.entrySet()) {
+                Path file = e.getKey();
+                ProjectIndex.CachedMetadata cm = e.getValue();
+                writer.write("m" + SEP + FileMetadataRow.encode(file, cm.mtime(), cm.size(), cm.metadata()));
+                writer.newLine();
+            }
         }
 
         private static void writeRootSubtree(BufferedWriter writer, Path scanRoot) throws IOException {
@@ -508,6 +712,165 @@ public final class ProjectIndexCache {
                         "Malformed ProjectIndex cache 'd' row: " + LogSanitizer.sanitize(row)));
             }
             return new DirSnapshot(parts[0], parts[1], Long.parseLong(parts[2]), Integer.parseInt(parts[3]));
+        }
+    }
+
+    /**
+     * One on-disk row of Stage&nbsp;2 per-file metadata.
+     *
+     * <p>Wire shape (single line, tab-separated outer fields):
+     * <pre>
+     *   m\t&lt;absPath&gt;\t&lt;mtime&gt;\t&lt;size&gt;\t&lt;package&gt;\t&lt;primaryType?&gt;\t&lt;imports&gt;\t&lt;refSimples&gt;\t&lt;refDotted&gt;\t&lt;decls&gt;
+     * </pre>
+     *
+     * <p>Inner list separators avoid any character that can legally
+     * appear inside a Java identifier or qualified name:
+     * <ul>
+     *   <li>{@code |} between list entries</li>
+     *   <li>{@code :} between an import name and its kind flag (n / s / w / sw)</li>
+     *   <li>{@code =} between a declaration's simple name and its supertype list</li>
+     *   <li>{@code ,} between supertype names within a single declaration</li>
+     * </ul>
+     * <p>Empty list fields write as the empty string between two tabs;
+     * the reader produces {@link Set#of()} / {@link List#of()} for those.
+     */
+    record FileMetadataRow(String path, long mtime, long size, FileMetadata metadata) {
+
+        /** Encodes a single per-file row. Caller adds the leading {@code m\t} prefix. */
+        static String encode(Path file, long mtime, long size, FileMetadata md) {
+            StringBuilder sb = new StringBuilder();
+            sb.append(file.toAbsolutePath().toString());
+            sb.append(SEP).append(mtime);
+            sb.append(SEP).append(size);
+            sb.append(SEP).append(md.packageName());
+            sb.append(SEP).append(md.primaryTypeName() == null ? "" : md.primaryTypeName());
+            sb.append(SEP).append(encodeImports(md.imports()));
+            sb.append(SEP).append(joinList(md.typeRefSimpleNames()));
+            sb.append(SEP).append(joinList(md.typeRefDottedNames()));
+            sb.append(SEP).append(encodeDecls(md.typeDeclarations()));
+            return sb.toString();
+        }
+
+        /**
+         * Parses a single per-file row body (the part after the
+         * leading {@code m\t}). Returns {@code null} for any row that
+         * does not have the expected number of fields, falls through
+         * to a row-skip in the reader rather than aborting the whole
+         * cache load — a single garbled row should not invalidate
+         * every other file's cached metadata.
+         */
+        static FileMetadataRow parse(String row) {
+            String[] parts = row.split(String.valueOf(SEP), -1);
+            if (parts.length < 9) {
+                return null;
+            }
+            try {
+                String path = parts[0];
+                long mtime = Long.parseLong(parts[1]);
+                long size = Long.parseLong(parts[2]);
+                String pkg = parts[3];
+                String primary = parts[4].isEmpty() ? null : parts[4];
+                List<FileMetadata.Import> imports = decodeImports(parts[5]);
+                Set<String> refSimples = decodeSet(parts[6]);
+                Set<String> refDotted = decodeSet(parts[7]);
+                List<FileMetadata.TypeDecl> decls = decodeDecls(parts[8]);
+                FileMetadata md = new FileMetadata(pkg, primary, imports, refSimples, refDotted, decls);
+                return new FileMetadataRow(path, mtime, size, md);
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
+        private static String encodeImports(List<FileMetadata.Import> imports) {
+            if (imports.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < imports.size(); i++) {
+                if (i > 0) sb.append(LIST_SEP);
+                FileMetadata.Import imp = imports.get(i);
+                sb.append(imp.name()).append(IMPORT_KIND_SEP).append(importFlag(imp));
+            }
+            return sb.toString();
+        }
+
+        private static String importFlag(FileMetadata.Import imp) {
+            if (imp.isStatic() && imp.isAsterisk()) return "sw";
+            if (imp.isStatic()) return "s";
+            if (imp.isAsterisk()) return "w";
+            return "n";
+        }
+
+        private static List<FileMetadata.Import> decodeImports(String raw) {
+            if (raw.isEmpty()) return List.of();
+            List<FileMetadata.Import> out = new ArrayList<>();
+            for (String entry : raw.split("\\" + LIST_SEP, -1)) {
+                int kindIdx = entry.lastIndexOf(IMPORT_KIND_SEP);
+                if (kindIdx <= 0 || kindIdx == entry.length() - 1) continue;
+                String name = entry.substring(0, kindIdx);
+                String flag = entry.substring(kindIdx + 1);
+                boolean isStatic = flag.equals("s") || flag.equals("sw");
+                boolean isAsterisk = flag.equals("w") || flag.equals("sw");
+                out.add(new FileMetadata.Import(name, isStatic, isAsterisk));
+            }
+            return out;
+        }
+
+        private static String joinList(Set<String> values) {
+            if (values.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            boolean first = true;
+            for (String v : values) {
+                if (!first) sb.append(LIST_SEP);
+                sb.append(v);
+                first = false;
+            }
+            return sb.toString();
+        }
+
+        private static Set<String> decodeSet(String raw) {
+            if (raw.isEmpty()) return Set.of();
+            Set<String> out = new LinkedHashSet<>();
+            for (String entry : raw.split("\\" + LIST_SEP, -1)) {
+                if (!entry.isEmpty()) out.add(entry);
+            }
+            return out;
+        }
+
+        private static String encodeDecls(List<FileMetadata.TypeDecl> decls) {
+            if (decls.isEmpty()) return "";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < decls.size(); i++) {
+                if (i > 0) sb.append(LIST_SEP);
+                FileMetadata.TypeDecl d = decls.get(i);
+                sb.append(d.simpleName()).append(DECL_SEP);
+                List<String> sup = d.supertypeSimpleNames();
+                for (int j = 0; j < sup.size(); j++) {
+                    if (j > 0) sb.append(SUPER_SEP);
+                    sb.append(sup.get(j));
+                }
+            }
+            return sb.toString();
+        }
+
+        private static List<FileMetadata.TypeDecl> decodeDecls(String raw) {
+            if (raw.isEmpty()) return List.of();
+            List<FileMetadata.TypeDecl> out = new ArrayList<>();
+            for (String entry : raw.split("\\" + LIST_SEP, -1)) {
+                int eq = entry.indexOf(DECL_SEP);
+                if (eq < 0) continue;
+                String simple = entry.substring(0, eq);
+                String supRaw = entry.substring(eq + 1);
+                List<String> sup;
+                if (supRaw.isEmpty()) {
+                    sup = List.of();
+                } else {
+                    sup = new ArrayList<>();
+                    for (String s : supRaw.split(String.valueOf(SUPER_SEP), -1)) {
+                        if (!s.isEmpty()) sup.add(s);
+                    }
+                }
+                out.add(new FileMetadata.TypeDecl(simple, sup));
+            }
+            return out;
         }
     }
 }

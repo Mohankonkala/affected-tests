@@ -852,4 +852,122 @@ class AffectedTestsEngineTest {
                     "SKIPPED must yield no selected tests");
         }
     }
+
+    @Test
+    void coldRunAndWarmRunSelectIdenticalTestsAcrossAllStrategies() throws Exception {
+        // End-to-end Stage 2 contract: a warm run (Project​IndexCache hit
+        // — every {@code FileMetadata} row seeded from disk, zero AST
+        // re-parses for unchanged files) MUST yield byte-identical
+        // SELECTED output to a cold run (cache miss — every metadata
+        // row freshly extracted). If a strategy ever forgets to thread
+        // a field through the cache rewire, the warm run will quietly
+        // miss tests the cold run picks up — the symptom is "the second
+        // build of the same diff selects fewer tests than the first",
+        // which is exactly the silent regression Stage 2's per-file
+        // invalidation must prevent.
+        //
+        // Scope: run all three index-backed strategies (usage,
+        // implementation, transitive) plus naming so a single drop in
+        // any cached field is loud at the engine level.
+        try (Git git = initRepoWithInitialCommit()) {
+            String base = git.log().call().iterator().next().getName();
+
+            Path prodDir = tempDir.resolve("src/main/java/com/example");
+            Files.createDirectories(prodDir);
+            Files.writeString(prodDir.resolve("Greeter.java"), """
+                    package com.example;
+                    public interface Greeter { String greet(String n); }
+                    """);
+            Files.writeString(prodDir.resolve("EnglishGreeter.java"), """
+                    package com.example;
+                    public class EnglishGreeter implements Greeter {
+                        public String greet(String n) { return "hi " + n; }
+                    }
+                    """);
+            Files.writeString(prodDir.resolve("GreetService.java"), """
+                    package com.example;
+                    public class GreetService {
+                        private final Greeter g;
+                        public GreetService(Greeter g) { this.g = g; }
+                        public String run(String n) { return g.greet(n); }
+                    }
+                    """);
+
+            Path testDir = tempDir.resolve("src/test/java/com/example");
+            Files.createDirectories(testDir);
+            Files.writeString(testDir.resolve("EnglishGreeterTest.java"), """
+                    package com.example;
+                    public class EnglishGreeterTest {
+                        EnglishGreeter g = new EnglishGreeter();
+                    }
+                    """);
+            Files.writeString(testDir.resolve("GreetServiceTest.java"), """
+                    package com.example;
+                    public class GreetServiceTest {
+                        GreetService s = new GreetService(new EnglishGreeter());
+                    }
+                    """);
+            Files.writeString(testDir.resolve("GreeterContractTest.java"), """
+                    package com.example;
+                    public class GreeterContractTest {
+                        Greeter g;
+                    }
+                    """);
+
+            git.add().addFilepattern(".").call();
+            git.commit().setMessage("seed sources + tests").call();
+
+            // Modify Greeter (the interface) so the diff drives every
+            // strategy: usage matches anything that references {@code
+            // Greeter}, implementation matches {@code EnglishGreeter}'s
+            // implements clause, transitive walks
+            // {@code GreetService} -> Greeter -> tests in one hop.
+            Files.writeString(prodDir.resolve("Greeter.java"), """
+                    package com.example;
+                    public interface Greeter {
+                        String greet(String n);
+                        default String shout(String n) { return greet(n).toUpperCase(); }
+                    }
+                    """);
+            git.add().addFilepattern(".").call();
+            git.commit().setMessage("widen Greeter contract").call();
+
+            AffectedTestsConfig config = AffectedTestsConfig.builder()
+                    .baseRef(base)
+                    .includeUncommitted(false)
+                    .includeStaged(false)
+                    .strategies(Set.of("naming", "usage", "implementation", "transitive"))
+                    .transitiveDepth(2)
+                    .build();
+
+            // Cold run: no Stage 1 dir snapshot, no Stage 2 metadata
+            // rows on disk, every CompilationUnit must be parsed fresh.
+            AffectedTestsEngine cold = new AffectedTestsEngine(config, tempDir);
+            AffectedTestsEngine.AffectedTestsResult coldResult = cold.run();
+
+            // Warm run: same workspace, same diff, same engine config —
+            // but now build/affected-tests/index/v1/ has both a Stage 1
+            // dir snapshot and Stage 2 metadata rows that match every
+            // file's current (mtime, size). Strategies should consume
+            // the cached FileMetadata, NOT re-parse from source.
+            AffectedTestsEngine warm = new AffectedTestsEngine(config, tempDir);
+            AffectedTestsEngine.AffectedTestsResult warmResult = warm.run();
+
+            assertEquals(coldResult.testClassFqns(), warmResult.testClassFqns(),
+                    "Warm run (Stage 2 cache hit) must select the same tests as the cold "
+                            + "run (cache miss). A drift here means a strategy is reading "
+                            + "a field that the cache rewire dropped.");
+            assertFalse(coldResult.testClassFqns().isEmpty(),
+                    "Test scaffold must produce a non-empty selection — otherwise the "
+                            + "equality assertion above is vacuously true and the "
+                            + "regression net catches nothing");
+            assertEquals(coldResult.runAll(), warmResult.runAll(),
+                    "runAll flag is part of the SELECTED contract — flipping it across "
+                            + "warm/cold would break downstream task wiring silently");
+            assertEquals(coldResult.escalationReason(), warmResult.escalationReason(),
+                    "Escalation reason must be deterministic across warm/cold; a drift "
+                            + "indicates the cache changed an upstream signal that drives "
+                            + "escalation, not just discovery output");
+        }
+    }
 }
