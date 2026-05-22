@@ -116,3 +116,7 @@ issues for security reports.
 Be kind. Engage with the technical content, not the contributor.
 The goal is a plugin that is correct, fast, and operable — every
 review comment, commit message, and issue should serve that goal.
+
+The full standards and the enforcement / reporting flow live in
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) (Contributor
+Covenant 2.1). Read it before opening your first issue or PR.
