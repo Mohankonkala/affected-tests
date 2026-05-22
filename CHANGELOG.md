@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — Maven Central releases are now fully automatic (issue #87)
+
+The release pipeline no longer stages Maven Central deployments
+for a manual **Publish** click in the Sonatype portal.
+`publishToMavenCentral(true)` in `affected-tests-gradle/build.gradle`
+and `publishAndReleaseToMavenCentral` in `release.yml` upload,
+validate, and release each cut automatically. v2.2.20 was the last
+version published via the manual staging flow.
+
 ### Added — Maven Central publishing alongside Gradle Plugin Portal (issue #87)
 
 The plugin now publishes to **Maven Central** in addition to the Gradle
@@ -22,13 +31,10 @@ Adopters who pin checksums via `./gradlew --write-verification-metadata
 sha256` now have a second cryptographically-signed source to
 cross-verify against.
 
-For maintainers: the new `Publish to Maven Central` step in
-`release.yml` stages each release in the Sonatype Central Portal
-without auto-releasing. The first few releases are reviewed and
-released manually from `central.sonatype.com`; once the pipeline is
-proven, `publishToMavenCentral(false)` in
-`affected-tests-gradle/build.gradle` flips to `true`. Full secret
-setup and one-time GPG key generation steps are in
+For maintainers: the `Publish to Maven Central` step in
+`release.yml` auto-releases each cut (see the **Changed** entry
+above for when manual staging was retired). Full secret setup and
+one-time GPG key generation steps are in
 [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ### Added — persistent per-file ProjectIndex cache, stage 2 (issue #41)

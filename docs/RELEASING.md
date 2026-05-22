@@ -4,8 +4,8 @@ This doc captures the maintainer-side setup needed for the
 release pipeline (`.github/workflows/release.yml`) to publish
 to both the Gradle Plugin Portal and Maven Central. The
 release flow itself — tag → build → attest → publish — is
-fully automated; this doc is only about the one-time secret
-setup and the manual step on first Maven Central release.
+fully automated on both channels; this doc is only about the
+one-time secret and GPG key setup.
 
 ## Required GitHub repository secrets
 
@@ -99,56 +99,30 @@ except the GitHub-side secrets — for an end-to-end check using the
 actual repo secrets, trigger a `workflow_dispatch` run that only
 calls the sign tasks (no publish) on the release branch.
 
-## First Maven Central release (manual step)
+## Maven Central publish (automatic)
 
-The pipeline is configured with `publishToMavenCentral(false)`
-in `affected-tests-gradle/build.gradle`, which means it
-**stages** the deployment in the Sonatype Central Portal but
-does not auto-release it. For the first few releases:
+Each release triggers `publishAndReleaseToMavenCentral` in
+`release.yml`, which uploads the signed bundle to the Sonatype
+Central Portal and auto-releases it. No manual step in
+[central.sonatype.com](https://central.sonatype.com) is required.
 
-1. Trigger the release as normal (push to `master` or
-   `workflow_dispatch`).
-2. Wait for the workflow to finish — the `Publish to Maven
-   Central` step uploads the bundle and exits.
-3. Log into [central.sonatype.com](https://central.sonatype.com)
-   → **Deployments**.
-4. Find the staged deployment (named after the version, e.g.
-   `2.3.0`), inspect the artifacts list, and click **Publish**.
-5. ~15–30 minutes later the artifacts appear on
-   [search.maven.org](https://search.maven.org/search?q=g:io.github.vedanthvdev)
-   and `repo1.maven.org`. The release workflow's
-   `Check if Maven Central version already published` step
-   uses that propagation as its signal for idempotent re-runs.
+Artifacts appear on
+[search.maven.org](https://search.maven.org/search?q=g:io.github.vedanthvdev)
+and `repo1.maven.org` ~15–30 minutes after the workflow step
+succeeds. The `Check if Maven Central version already published`
+step uses that propagation as its idempotency signal.
 
-Once the pipeline has published a few releases cleanly and
-the maintainer is confident in the wiring, flip
-`publishToMavenCentral(false)` to `publishToMavenCentral(true)`
-and change the workflow task from `publishToMavenCentral` to
-`publishAndReleaseToMavenCentral` to skip the manual step.
+### Recovering from a failed or re-run release
 
-### Recovering from a re-run while a deployment is staged
+If you re-run the workflow while a version is still propagating
+to `repo1.maven.org` (HEAD returns 404), the `Publish to Maven
+Central` step may attempt a duplicate upload. Sonatype rejects it
+and the step fails — the Plugin Portal publish, SLSA attestation,
+and GitHub Release from the original run are already done.
 
-The workflow's `Check if Maven Central version already published`
-step probes `repo1.maven.org`. A version that has been **staged**
-but **not yet released** in the Sonatype portal is invisible to
-that probe — the HEAD returns 404 and the workflow attempts a
-duplicate upload, which Sonatype rejects.
-
-If you re-run the workflow before clicking **Publish** in the
-Sonatype portal:
-
-1. Log into [central.sonatype.com](https://central.sonatype.com)
-   → **Deployments**.
-2. Either **release** the staged deployment (the normal happy
-   path — the rerun's MC step then fails benignly because
-   `repo1.maven.org` won't have the version yet, and the next
-   run skips MC after propagation), **or** click **Drop** to
-   discard it. Re-trigger the workflow only after one of the
-   two states is reached.
-
-The Plugin Portal publish, the SLSA attestation, and the GitHub
-Release from the original run are unaffected by either choice —
-they ran before the MC step and have already succeeded.
+Wait for propagation (~30 min) and re-run, or check
+[central.sonatype.com](https://central.sonatype.com) →
+**Deployments** if a deployment is stuck in a non-terminal state.
 
 ## Verifying a release
 
