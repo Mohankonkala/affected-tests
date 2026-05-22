@@ -131,13 +131,11 @@ gradlePlugin {
 
 // Maven Central (Sonatype Central Portal) publishing — see issue #87.
 //
-// `publishToMavenCentral(false)` stages the artifact in the portal but
-// does NOT auto-release. The maintainer reviews the staged deployment
-// in https://central.sonatype.com and releases manually for the first
-// few cuts; once the pipeline is proven the flag flips to `true` for
-// fully-automatic releases. Idempotency mirrors the Plugin Portal
-// pattern in release.yml — the workflow's repo1.maven.org HEAD check
-// short-circuits a re-run that has already published.
+// `publishToMavenCentral(true)` uploads and auto-releases each cut in
+// the Sonatype Central Portal. The release workflow calls
+// `publishAndReleaseToMavenCentral` to match. Idempotency mirrors the
+// Plugin Portal pattern in release.yml — the workflow's repo1.maven.org
+// HEAD check short-circuits a re-run once the version has propagated.
 //
 // `coordinates(...)` pins the implementation publication's artifactId.
 // The marker publication's artifactId is set by `java-gradle-plugin`
@@ -149,7 +147,7 @@ gradlePlugin {
 // for both is intentional — both rows on Central represent the same
 // logical plugin from the adopter's perspective.
 mavenPublishing {
-    publishToMavenCentral(false)
+    publishToMavenCentral(true)
 
     // Signing is gated on the key actually being available so a
     // local `publishToMavenLocal` (used for offline smoke tests) does

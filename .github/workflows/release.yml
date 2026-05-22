@@ -182,12 +182,10 @@ jobs:
       # Maven Central HEAD probe. A 200 means the version has propagated
       # to repo1.maven.org and we should skip re-upload. A 404 covers
       # both "not yet published" and "still in the 15-30 min propagation
-      # window after a successful Sonatype publish" — the upload step
-      # proceeds in both cases. If Sonatype rejects a duplicate (i.e.
-      # the version is already staged or already released), the step
-      # fails loud and the maintainer drops the staged deployment in
-      # the Sonatype portal before re-running. See docs/RELEASING.md
-      # for the recovery flow.
+      # window after auto-release" — the upload step proceeds in both
+      # cases. If Sonatype rejects a duplicate upload, the step fails
+      # loud; wait for propagation or check the Sonatype portal. See
+      # docs/RELEASING.md for the recovery flow.
       - name: Check if Maven Central version already published
         id: central_check
         env:
@@ -247,13 +245,13 @@ jobs:
       # Publish to Sonatype Central Portal via the vanniktech plugin
       # configured in affected-tests-gradle/build.gradle.
       #
-      # `publishToMavenCentral` (NOT `publishAndReleaseToMavenCentral`)
-      # stages the deployment in the portal without auto-releasing.
-      # The maintainer reviews it at https://central.sonatype.com,
-      # then clicks Publish for the first few releases. Once the
-      # pipeline is proven, flip `publishToMavenCentral(false)` to
-      # `publishToMavenCentral(true)` in affected-tests-gradle/build.gradle
-      # and switch the task here to `publishAndReleaseToMavenCentral`.
+      # `publishAndReleaseToMavenCentral` uploads, validates, and
+      # auto-releases the deployment — no manual click in the Sonatype
+      # portal. Matches `publishToMavenCentral(true)` in build.gradle.
+      # Artifacts appear on repo1.maven.org ~15–30 min later; until
+      # then `central_check` returns 404 and a re-run may attempt a
+      # duplicate upload (Sonatype rejects it — benign if Portal +
+      # GitHub Release already succeeded).
       #
       # Secrets are routed through `ORG_GRADLE_PROJECT_*` env vars,
       # which Gradle exposes as project properties — the same channel
@@ -267,7 +265,7 @@ jobs:
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
-        run: ./gradlew :affected-tests-gradle:publishToMavenCentral --no-configuration-cache
+        run: ./gradlew :affected-tests-gradle:publishAndReleaseToMavenCentral --no-configuration-cache
 
       - name: Create GitHub Release
         env:
