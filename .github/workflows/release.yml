@@ -153,11 +153,18 @@ jobs:
       - name: Build
         run: ./gradlew clean build
 
-      # Ask the Plugin Portal whether this exact version already exists. If a
-      # previous run tagged + built + published successfully but failed after
-      # (e.g. when creating the GitHub Release), re-running the workflow must
-      # not attempt to publish the same artifact twice — the portal rejects
-      # re-publishing and the whole job would fail.
+      # Two idempotency checks — Plugin Portal (`portal_check`) and
+      # Maven Central (`central_check`) — run BEFORE attestation so the
+      # attest step can be gated on "either channel still needs to
+      # publish". Otherwise, on a retry where one channel already has
+      # the version and the other does not, attestation would be skipped
+      # and the still-pending channel would receive a freshly-rebuilt
+      # (un-attested) JAR. See issue #87.
+      #
+      # Plugin Portal already has the version → skip Portal publish.
+      # `clean build` always runs above, so the rebuilt JAR may have a
+      # different SHA-256 than the run that originally published; that
+      # is why we skip re-attesting AND re-publishing the Portal side.
       - name: Check if plugin version already published
         id: portal_check
         env:
@@ -172,39 +179,59 @@ jobs:
             echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Maven Central HEAD probe. A 200 means the version has propagated
+      # to repo1.maven.org and we should skip re-upload. A 404 covers
+      # both "not yet published" and "still in the 15-30 min propagation
+      # window after a successful Sonatype publish" — the upload step
+      # proceeds in both cases. If Sonatype rejects a duplicate (i.e.
+      # the version is already staged or already released), the step
+      # fails loud and the maintainer drops the staged deployment in
+      # the Sonatype portal before re-running. See docs/RELEASING.md
+      # for the recovery flow.
+      - name: Check if Maven Central version already published
+        id: central_check
+        env:
+          VERSION: ${{ steps.released.outputs.version }}
+        run: |
+          URL="https://repo1.maven.org/maven2/io/github/vedanthvdev/affected-tests-gradle/$VERSION/"
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -L "$URL")
+          if [[ "$STATUS" == "200" ]]; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "Version $VERSION already on Maven Central — skipping upload."
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # SLSA build provenance attestation. Cryptographically binds the
-      # shadow JAR(s) sitting in build/libs/ to (a) the exact commit
-      # being released, (b) this workflow file at this SHA, and (c) the
+      # JARs sitting in build/libs/ to (a) the exact commit being
+      # released, (b) this workflow file at this SHA, and (c) the
       # workflow run that produced them. Recorded in Sigstore's public
       # transparency log (Rekor) and replayable by any consumer via
-      # `gh attestation verify <jar> --owner vedanthvdev` — the gap that
-      # the "personal namespace, no hash pinning" reviewer feedback
-      # (issue #83) called out.
+      # `gh attestation verify <jar> --owner vedanthvdev` — the gap
+      # that the "personal namespace, no hash pinning" reviewer
+      # feedback (issue #83) called out.
       #
-      # Attesting BEFORE publishPlugins is deliberate: the JAR in
-      # build/libs/ after `clean build` is exactly what publishPlugins
-      # uploads, so the attestation matches the artifact that lands on
-      # the Plugin Portal. If publish then fails, the attestation is
-      # harmless — there's no published artifact for it to point at —
-      # and a retry rebuilds + re-attests against a fresh JAR.
+      # Gated on EITHER channel still needing to publish so a retry
+      # where (say) the Plugin Portal already has the version but
+      # Maven Central does not still produces a fresh attestation that
+      # matches the bytes about to land on Maven Central. Skipped only
+      # when both channels are already done — re-attesting then would
+      # bind a stale rebuild to no published artifact.
       #
-      # Skipped when the version is already on the Portal because that
-      # JAR was attested by the prior successful run; re-attesting a
-      # freshly-rebuilt JAR (different timestamps → different SHA-256)
-      # would only create a second attestation that does not match the
-      # published artifact.
-      #
-      # Glob covers the relocated shadow JAR (the plugin implementation)
-      # — the only artifact in build/libs/ at this point because the
-      # default `jar` task is disabled in affected-tests-gradle/build.gradle
-      # and shadowJar uses an empty classifier. The plugin marker JAR
+      # Glob covers everything in build/libs/ produced by `clean build`:
+      #   * The relocated shadow JAR (the plugin implementation)
+      #   * The sources JAR (added by the vanniktech maven-publish
+      #     plugin for Maven Central, see issue #87)
+      #   * The javadoc JAR (same source)
+      # All three come from the same workflow run and are tied to the
+      # same commit, so attesting the full set means a consumer who
+      # downloads sources/javadoc from Maven Central can verify those
+      # too — not just the runtime JAR. The plugin marker JAR
       # auto-generated by `com.gradle.plugin-publish` is materialized
-      # later, inside `publishPlugins`, and is a code-free POM stub —
-      # attesting it would add a second attestation that proves nothing
-      # the implementation attestation does not already prove. Sources /
-      # Javadoc JARs are not produced by this build.
+      # later (inside `publishPlugins`) and is a code-free POM stub,
+      # so it's deliberately excluded.
       - name: Attest build provenance
-        if: steps.portal_check.outputs.already_published == 'false'
+        if: steps.portal_check.outputs.already_published == 'false' || steps.central_check.outputs.already_published == 'false'
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: |
@@ -216,6 +243,31 @@ jobs:
           GRADLE_PUBLISH_KEY: ${{ secrets.GRADLE_PUBLISH_KEY }}
           GRADLE_PUBLISH_SECRET: ${{ secrets.GRADLE_PUBLISH_SECRET }}
         run: ./gradlew publishPlugins
+
+      # Publish to Sonatype Central Portal via the vanniktech plugin
+      # configured in affected-tests-gradle/build.gradle.
+      #
+      # `publishToMavenCentral` (NOT `publishAndReleaseToMavenCentral`)
+      # stages the deployment in the portal without auto-releasing.
+      # The maintainer reviews it at https://central.sonatype.com,
+      # then clicks Publish for the first few releases. Once the
+      # pipeline is proven, flip `publishToMavenCentral(false)` to
+      # `publishToMavenCentral(true)` in affected-tests-gradle/build.gradle
+      # and switch the task here to `publishAndReleaseToMavenCentral`.
+      #
+      # Secrets are routed through `ORG_GRADLE_PROJECT_*` env vars,
+      # which Gradle exposes as project properties — the same channel
+      # vanniktech reads `mavenCentralUsername` / `signingInMemoryKey`
+      # / etc. from. This avoids ever writing them to disk in
+      # gradle.properties on the runner.
+      - name: Publish to Maven Central
+        if: steps.central_check.outputs.already_published == 'false'
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
+        run: ./gradlew :affected-tests-gradle:publishToMavenCentral --no-configuration-cache
 
       - name: Create GitHub Release
         env:
