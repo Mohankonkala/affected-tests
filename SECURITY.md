@@ -2,11 +2,22 @@
 
 ## Supported versions
 
-The plugin is published to the Gradle Plugin Portal as
-`io.github.vedanthvdev.affectedtests`. Security fixes are issued
-against the latest minor line on `master` only. Older minor lines
-are not back-patched — adopters should track `master`'s latest
-release.
+The plugin is published to two official channels — adopters
+should treat any other source as untrusted:
+
+| Channel | Coordinate |
+| --- | --- |
+| [Gradle Plugin Portal](https://plugins.gradle.org/plugin/io.github.vedanthvdev.affectedtests) | `io.github.vedanthvdev.affectedtests` |
+| [Maven Central](https://central.sonatype.com/artifact/io.github.vedanthvdev/affected-tests-gradle) | `io.github.vedanthvdev:affected-tests-gradle` |
+
+Both channels publish identical JAR bytes from the same CI
+release run. Maven Central artifacts are GPG-signed (a Sonatype
+hard requirement); SLSA build provenance covers both — see
+"Verifying artifact provenance" below.
+
+Security fixes are issued against the latest minor line on
+`master` only. Older minor lines are not back-patched — adopters
+should track `master`'s latest release.
 
 | Version | Security fixes |
 | --- | --- |
@@ -54,9 +65,11 @@ implementation attestation does not already say.
 
 ### Verification in two steps
 
-1. Resolve the implementation JAR Gradle pulled from the Plugin
-   Portal. When the plugin is applied via the `plugins {}` DSL,
-   the JAR lands in your Gradle cache at:
+1. Resolve the implementation JAR Gradle pulled from whichever
+   channel served the request (Plugin Portal or Maven Central).
+   The Gradle cache layout is keyed off the resolved coordinate,
+   not the source repository, so the path is the same regardless
+   of which channel Gradle picked:
 
    ```
    ~/.gradle/caches/modules-2/files-2.1/io.github.vedanthvdev/affected-tests-gradle/<version>/<sha1>/affected-tests-gradle-<version>.jar

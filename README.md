@@ -15,7 +15,7 @@ plugins {
 }
 ```
 
-> Check [Gradle Plugin Portal](https://plugins.gradle.org/plugin/io.github.vedanthvdev.affectedtests) for the latest version.
+> Check the [Gradle Plugin Portal](https://plugins.gradle.org/plugin/io.github.vedanthvdev.affectedtests) or [Maven Central](https://central.sonatype.com/artifact/io.github.vedanthvdev/affected-tests-gradle) for the latest version. Both channels publish identical, SLSA-attested artifacts from the same CI run; Maven Central artifacts are additionally GPG-signed. See [`SECURITY.md`](SECURITY.md) for the verification flow.
 
 ### 2. Run affected tests
 

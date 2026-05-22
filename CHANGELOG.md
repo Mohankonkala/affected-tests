@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Maven Central publishing alongside Gradle Plugin Portal (issue #87)
+
+The plugin now publishes to **Maven Central** in addition to the Gradle
+Plugin Portal. Both channels ship identical JAR bytes from the same CI
+release run; Maven Central artifacts are GPG-signed (a Sonatype hard
+requirement) and the SLSA build provenance from issue #83 covers both.
+
+For adopters: nothing changes by default — the existing
+`plugins { id 'io.github.vedanthvdev.affectedtests' version 'x.y.z' }`
+block continues to resolve from the Plugin Portal. Adopters who prefer
+Maven Central as the source can add `mavenCentral()` to their
+`pluginManagement.repositories` and the same coordinate resolves there.
+Adopters who pin checksums via `./gradlew --write-verification-metadata
+sha256` now have a second cryptographically-signed source to
+cross-verify against.
+
+For maintainers: the new `Publish to Maven Central` step in
+`release.yml` stages each release in the Sonatype Central Portal
+without auto-releasing. The first few releases are reviewed and
+released manually from `central.sonatype.com`; once the pipeline is
+proven, `publishToMavenCentral(false)` in
+`affected-tests-gradle/build.gradle` flips to `true`. Full secret
+setup and one-time GPG key generation steps are in
+[`docs/RELEASING.md`](docs/RELEASING.md).
+
 ### Added — persistent per-file ProjectIndex cache, stage 2 (issue #41)
 
 Stage 1 of issue #41 (PR #78) added a persistent
