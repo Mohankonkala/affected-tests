@@ -88,3 +88,45 @@ jobs:
             affected-tests-core/build/test-results/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Supply-chain gate. Diffs the PR's resolved Gradle dependency graph
+  # against the master baseline submitted by dependency-submission.yml
+  # and fails if any newly introduced dependency carries a known CVE at
+  # `fail-on-severity` or above. Pairs with the SLSA build provenance
+  # attestation in release.yml (issue #83) — provenance protects the
+  # consumer-facing publish path; this job protects the contributor-
+  # facing inbound path. A malicious or compromised transitive bump
+  # landing in a PR is exactly the threat the reviewer called out for
+  # a security-service-adjacent plugin.
+  #
+  # Coverage of transitive deps depends on dependency-submission.yml
+  # having run at least once on master. Without that baseline GitHub's
+  # auto-detection only sees direct deps declared in build.gradle, and
+  # transitive bumps (the most common attack path) would slip through.
+  #
+  # Job-scoped permissions: the workflow-level `contents: read` is
+  # repeated explicitly because job-level `permissions` REPLACE the
+  # workflow-level set rather than extending it; without the
+  # `contents: read` line below, the action could not read the PR diff.
+  # `pull-requests: write` is the minimum scope needed to leave the
+  # one-time summary comment on the PR when a vulnerable dep is found.
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # `high` matches what GitHub's own Dependabot security alerts
+          # surface as actionable on this repo. `moderate` would be
+          # noisier without changing the threat picture for a build-time
+          # plugin (no runtime network surface).
+          fail-on-severity: high
+          # Only post on failure — green PRs stay quiet. The summary
+          # comment is the fastest path from "CI red" to "here is the
+          # exact CVE-tagged dep that landed in your diff".
+          comment-summary-in-pr: on-failure
