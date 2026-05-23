@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Phase 2 Kotlin AST tech plan (issue #76 / #47)
+
+`docs/PHASE-2-KOTLIN-AST.md` lays out the plan for making Kotlin a
+first-class source language in the discovery engine — `LanguageParser`
+interface, `kotlin-compiler-embeddable` dependency, shading rules under
+`io.affectedtests.shadow.kotlin`, FQN-resolution rules, cache-schema
+bump, and a four-PR rollout. Plan-only — no engine code changes
+in this entry.
+
 ### Changed — Maven Central releases are now fully automatic (issue #87)
 
 The release pipeline no longer stages Maven Central deployments
