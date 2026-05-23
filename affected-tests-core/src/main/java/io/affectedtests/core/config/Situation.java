@@ -67,9 +67,9 @@ public enum Situation {
      * is non-zero.
      *
      * <p>Motivating class of bug: a test file using a Java language level
-     * newer than {@link io.affectedtests.core.discovery.JavaParsers} knows
+     * newer than {@link io.affectedtests.core.discovery.JavaLanguageParser} knows
      * about (or genuinely malformed source) produces {@code null} from
-     * {@code JavaParsers.parseOrWarn} and silently drops out of usage /
+     * {@code JavaLanguageParser.compilationUnit} and silently drops out of usage /
      * transitive discovery. Before v1.9.22 the only surfacing was a WARN
      * at parse time; the engine still routed through {@code DISCOVERY_EMPTY}
      * or {@code DISCOVERY_SUCCESS}, and a caller grepping the

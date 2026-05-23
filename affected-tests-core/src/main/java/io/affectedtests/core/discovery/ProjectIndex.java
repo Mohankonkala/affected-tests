@@ -1,6 +1,5 @@
 package io.affectedtests.core.discovery;
 
-import com.github.javaparser.JavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import io.affectedtests.core.config.AffectedTestsConfig;
 import io.affectedtests.core.mapping.OutOfScopeMatchers;
@@ -24,13 +23,17 @@ import java.util.function.Predicate;
  * <p>{@link CompilationUnit}s are parsed lazily on first access and cached.
  * <strong>Thread-safety contract (issue #42)</strong>: the lookup map and
  * parse-failure counter are safe under concurrent {@link #compilationUnit}
- * calls from multiple discovery strategies, and the parser itself is held
- * in a {@link ThreadLocal} so each thread parses with its own
- * {@link JavaParser} instance (JavaParser's mutable parser-config and
- * symbol-resolver state make a single shared parser unsafe to invoke
- * concurrently). Callers still MUST NOT use the returned CU from
- * multiple threads concurrently — that's a JavaParser AST constraint
- * that no amount of cache wrapping can paper over.
+ * calls from multiple discovery strategies. Per-language thread-safety
+ * is delegated to the {@link LanguageParser} implementation —
+ * {@link JavaLanguageParser} owns a {@link ThreadLocal} of
+ * {@link com.github.javaparser.JavaParser} (JavaParser's mutable
+ * parser-config and symbol-resolver state make a single shared parser
+ * unsafe to invoke concurrently); PR #3's {@code KotlinLanguageParser}
+ * will own a single shared {@code KotlinCoreEnvironment} per
+ * {@link ProjectIndex} with PSI traversals wrapped in
+ * {@code runReadAction}. Callers still MUST NOT use the returned CU
+ * from multiple threads concurrently — that's a JavaParser AST
+ * constraint that no amount of cache wrapping can paper over.
  */
 public final class ProjectIndex {
 
@@ -122,32 +125,9 @@ public final class ProjectIndex {
     }
 
     /**
-     * Per-thread parser. JavaParser instances are not safe to share
-     * across threads (their {@code ParserConfiguration} is mutated
-     * during parse and the symbol-resolver state is per-instance).
-     * {@code ThreadLocal.withInitial} keeps the construction cost off
-     * the critical path — each thread builds its parser exactly
-     * once, on its first compilationUnit() call.
-     *
-     * <p>Held as a {@code static} field on purpose. An instance-level
-     * ThreadLocal would entry a fresh slot in every running thread's
-     * {@code ThreadLocalMap} for every engine run; on the serial path
-     * the calling thread is a Gradle-daemon worker that lives across
-     * builds, and the {@code JavaParser} values would leak ~30–80 KB
-     * each until the worker dies (`ThreadLocalMap` only expunges
-     * stale entries opportunistically). Promoting to {@code static}
-     * gives us one parser per thread, shared across every engine run
-     * the JVM serves — bounded growth, zero adopter cost. Pool
-     * threads on the parallel path are daemons that die at
-     * {@code shutdown()}, so they shed their parser entries
-     * naturally.
-     */
-    private static final ThreadLocal<JavaParser> PARSER =
-            ThreadLocal.withInitial(JavaParsers::newParser);
-
-    /**
-     * Count of distinct files that {@link JavaParsers#parseOrWarn}
-     * returned null for. The engine consults this after discovery to
+     * Count of distinct files that the per-extension
+     * {@link LanguageParser} returned {@code null} for. The engine
+     * consults this after discovery to
      * decide whether to route through
      * {@link io.affectedtests.core.config.Situation#DISCOVERY_INCOMPLETE}:
      * a parse failure silently drops the affected file from Usage /
@@ -165,6 +145,27 @@ public final class ProjectIndex {
      * mapping function exactly once per absent key, so a parse
      * failure is observed (and counted) by exactly one thread even
      * when N threads race to request the same unparseable file.
+     *
+     * <p>Bumped in exactly two places, partitioned by parser kind:
+     *
+     * <ul>
+     *   <li>{@link #compilationUnit(Path)} — Java parse failure
+     *       (a JavaParser-typed {@link CompilationUnit} consumer
+     *       got a {@code null} from
+     *       {@link JavaLanguageParser#compilationUnit(Path, String)}).</li>
+     *   <li>{@link #fileMetadata(Path)} non-Java branch — non-Java
+     *       parse failure (a registered {@link LanguageParser} that
+     *       does not produce a JavaParser CU returned {@code null}
+     *       from {@link LanguageParser#parseOrWarn}; today this
+     *       branch is dormant and lights up in PR #3 once
+     *       {@code KotlinLanguageParser} registers for {@code .kt}).</li>
+     * </ul>
+     *
+     * Files with no registered parser (e.g. {@code .kts},
+     * {@code .groovy}, {@code .scala}, or {@code .kt} pre-PR-3)
+     * never bump this counter — they're unparsed-by-design and
+     * surface to the operator via the unmapped-bucket pipeline,
+     * not via {@code DISCOVERY_INCOMPLETE}.
      */
     private final AtomicInteger parseFailureCount = new AtomicInteger();
 
@@ -350,52 +351,57 @@ public final class ProjectIndex {
     public Set<String> sourceFqns() { return sourceFqns; }
 
     /**
-     * Parses {@code file} with JavaParser, caching the result. Returns
-     * {@code null} if the file cannot be parsed (malformed source, I/O error).
+     * Parses {@code file} via the {@link LanguageParser} registered
+     * for its extension and returns the resulting
+     * {@link CompilationUnit}, or {@code null} when no
+     * {@code CompilationUnit} is available — either because the
+     * file failed to parse (malformed source, I/O error) or because
+     * the registered parser does not produce a JavaParser-typed
+     * {@code CompilationUnit} (i.e. PR #3's
+     * {@code KotlinLanguageParser}). Kotlin metadata reaches
+     * strategies via {@link #fileMetadata(Path)} instead, which
+     * dispatches through the {@link LanguageParser} interface.
      *
-     * <p>Results are shared across strategies so the same test file is parsed
-     * at most once per engine run, even when N strategies request it
-     * concurrently from different threads. The compute-once guarantee
-     * comes from {@link java.util.concurrent.ConcurrentHashMap#computeIfAbsent};
+     * <p>Results are shared across strategies so the same test file
+     * is parsed at most once per engine run, even when N strategies
+     * request it concurrently from different threads. The
+     * compute-once guarantee comes from
+     * {@link java.util.concurrent.ConcurrentHashMap#computeIfAbsent};
      * the same primitive ensures the parse-failure count is
      * incremented at most once per failing file no matter how many
      * threads race to ask for it.
      *
-     * <p>Returns {@code null} for {@code .kt} files in PR #1 of issue
-     * #76 without incrementing {@link #parseFailureCount} — Kotlin
-     * files are genuinely unparsed-by-design until PR #3 lands the
-     * Kotlin parser, and counting them as parse failures would
-     * trigger {@code DISCOVERY_INCOMPLETE} on every diff that touches
-     * a Kotlin file. PR #2 will replace the fixed JavaParser
-     * dispatch with a {@code LanguageParser} interface that
-     * dispatches by extension; PR #3 plugs in
-     * {@code KotlinLanguageParser}. See {@code docs/PHASE-2-KOTLIN-AST.md}
-     * §2-3.
+     * <p>Returns {@code null} for files whose extension has no
+     * registered {@link LanguageParser} (e.g. {@code .kt}
+     * pre-PR-3, or always for {@code .kts} / {@code .groovy} /
+     * {@code .scala}) <em>without</em> incrementing
+     * {@link #parseFailureCount} — those files are genuinely
+     * unparsed-by-design, and counting them as parse failures
+     * would trigger {@code DISCOVERY_INCOMPLETE} on every diff that
+     * touches one. The {@code parseFailureCount} bump is
+     * specifically reserved for files that <em>have</em> a
+     * registered parser and the parser failed; non-registered
+     * extensions surface to the operator via the unmapped-bucket
+     * pipeline, not via {@code DISCOVERY_INCOMPLETE}.
      */
     public CompilationUnit compilationUnit(Path file) {
         Optional<CompilationUnit> entry = cuCache.computeIfAbsent(file, key -> {
-            String ext = SourceExtensions.extensionOf(key.toString());
-            if (!".java".equals(ext)) {
-                // TODO(#76, PR #2): replace this short-circuit with
-                // LanguageParser.parse(file) dispatch. PR #1 of
-                // issue #76 ships path-derived Kotlin mapping only;
-                // PR #2 introduces the LanguageParser interface and
-                // PR #3 plugs in KotlinLanguageParser. This branch
-                // exists so .kt files do not accidentally count
-                // against parseFailureCount (which would surface as
-                // DISCOVERY_INCOMPLETE on every Kotlin diff). The
-                // marker is grep-able so a `git grep TODO(#76`
-                // lists every PR #2 hand-off site.
-                //
-                // Non-Java source recognised by SourceExtensions
-                // (i.e. .kt today): no parser available in PR #1.
-                // Distinct from a JavaParser failure on malformed
-                // .java — do not bump parseFailureCount here, or
-                // every Kotlin diff would surface as
-                // DISCOVERY_INCOMPLETE.
+            LanguageParser parser = LanguageParsers.forFile(key);
+            if (!(parser instanceof JavaLanguageParser jlp)) {
+                // Either no parser registered for this extension
+                // (e.g. .kt pre-PR-3, .kts, .groovy, .scala) or a
+                // non-Java parser is registered (PR #3 onward).
+                // The CompilationUnit return type is
+                // JavaParser-specific, so non-Java parsers don't
+                // surface a CU here — Kotlin metadata comes from
+                // fileMetadata(Path) which dispatches via the
+                // LanguageParser interface directly. Either way,
+                // do NOT bump parseFailureCount: the file is not
+                // a parse failure in the JavaParser sense; it has
+                // no JavaParser-shaped contract to violate.
                 return Optional.empty();
             }
-            CompilationUnit cu = JavaParsers.parseOrWarn(PARSER.get(), key, "index");
+            CompilationUnit cu = jlp.compilationUnit(key, "index");
             if (cu == null) {
                 parseFailureCount.incrementAndGet();
             }
@@ -430,11 +436,54 @@ public final class ProjectIndex {
      */
     public FileMetadata fileMetadata(Path file) {
         Optional<CachedMetadata> entry = metadataCache.computeIfAbsent(file, key -> {
-            CompilationUnit cu = compilationUnit(key);
-            if (cu == null) {
+            LanguageParser parser = LanguageParsers.forFile(key);
+            if (parser == null) {
+                // No registered parser for this extension (e.g.
+                // {@code .kts}, {@code .groovy}, {@code .scala}, or
+                // {@code .kt} pre-PR-3). Skip without bumping
+                // {@link #parseFailureCount}: these files are
+                // unparsed-by-design and surface to the operator
+                // via the unmapped-bucket pipeline, not via
+                // {@link io.affectedtests.core.config.Situation#DISCOVERY_INCOMPLETE}.
                 return Optional.empty();
             }
-            FileMetadata md = FileMetadataExtractor.extract(cu);
+            FileMetadata md;
+            if (parser instanceof JavaLanguageParser) {
+                // Java-side: read through {@link #compilationUnit(Path)}
+                // so a strategy that asks for both the raw CU and the
+                // metadata pays the parse cost once. The CU cache
+                // owns the {@code parseFailureCount} bump for Java
+                // (see {@link #compilationUnit(Path)}).
+                CompilationUnit cu = compilationUnit(key);
+                if (cu == null) {
+                    return Optional.empty();
+                }
+                md = FileMetadataExtractor.extract(cu);
+            } else {
+                // Non-Java parser: emits {@link FileMetadata}
+                // directly (e.g. Kotlin from PSI without a
+                // JavaParser-shaped {@code CompilationUnit}).
+                // {@link #compilationUnit(Path)} returns
+                // {@link Optional#empty()} for these — its return
+                // type is JavaParser-specific by construction — so
+                // the {@code parseFailureCount} bump for non-Java
+                // parsers lives here, not at the CU layer.
+                // Without this branch a malformed file in any
+                // non-Java registered language would silently drop
+                // out of discovery and fail to escalate to
+                // {@link io.affectedtests.core.config.Situation#DISCOVERY_INCOMPLETE},
+                // which is the exact silent-drop class of bug the
+                // counter exists to surface. The Java-side
+                // companion invariant is pinned by
+                // {@code ProjectIndexTest#fileMetadataBumpsParseFailureCountForJavaParseFailure};
+                // PR #3 will add the symmetric non-Java test once
+                // {@code KotlinLanguageParser} is in place.
+                md = parser.parseOrWarn(key, "index");
+                if (md == null) {
+                    parseFailureCount.incrementAndGet();
+                    return Optional.empty();
+                }
+            }
             // Capture the source file's (mtime, size) fingerprint
             // immediately after the parse so the persisted row reflects
             // the file version we actually consumed. The TOCTOU window

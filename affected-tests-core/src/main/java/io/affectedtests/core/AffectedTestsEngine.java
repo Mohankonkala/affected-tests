@@ -102,7 +102,7 @@ public final class AffectedTestsEngine {
         RUN_ALL_ON_ALL_FILES_OUT_OF_SCOPE,
         /**
          * One or more scanned Java files failed to parse (malformed
-         * source, or a language level beyond {@link io.affectedtests.core.discovery.JavaParsers#LANGUAGE_LEVEL}),
+         * source, or a language level beyond {@link io.affectedtests.core.discovery.JavaLanguageParser#LANGUAGE_LEVEL}),
          * so discovery may have under-reported its selection. The action
          * for {@link Situation#DISCOVERY_INCOMPLETE} resolved to
          * {@link Action#FULL_SUITE}, typically via {@link io.affectedtests.core.config.Mode#CI}

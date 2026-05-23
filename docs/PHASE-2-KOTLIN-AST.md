@@ -157,8 +157,8 @@ draft missed several. The complete list:
 | `PathToClassMapper#mapChangedFiles` line 167 (`!filePath.endsWith(".java")`) | Sends every non-Java file to `unmappedChangedFiles` | Accept `.kt` and route through `tryMapToClass`. |
 | `PathToClassMapper#tryMapToClass` (`if (relativePath.endsWith(".java"))` strip, ~line 266) | Strips only `.java` — so a `.kt` routed through here returns FQN ending in `.kt` (literal `.kt` becomes a dotted segment after `replace('/', '.')`) and silently poisons every downstream strategy | Strip both `.java` and `.kt`. For `.kt` files routed to **production** dirs, emit two FQNs into `changedProductionClasses`: the path-derived `Util` (matches the explicit-class case) and the synthetic `UtilKt` (matches the compiled top-level-function class). For `.kt` files routed to **test** dirs, emit only the path-derived FQN — test classes are conventionally instantiable types, and a synthetic `FooTestKt` would surface to the runner as "no tests found". |
 | `UsageStrategy#extractFqn` line ~295 (`if (fqn.endsWith(".java"))` strip) | Fallback FQN for test files whose path doesn't resolve cleanly against a configured test root | Strip both `.java` and `.kt`. |
-| `UsageStrategy#metadataOrGet`, `ImplementationStrategy#metadataOrGet`, `TransitiveStrategy#metadataOrGet` (`(Path, ProjectIndex, JavaParser fallbackParser)`) | When `index == null`, calls `JavaParsers.parseOrWarn(fallbackParser, ...)` then `FileMetadataExtractor.extract(cu)`. JavaParser-typed fallback. | Reroute through `LanguageParser.parseOrWarn(file, label)` driven by the file's extension. Keep the `JavaParser fallbackParser` argument as `@Deprecated` and unused for one release; new callers pass null. |
-| `JavaParsers.parseOrWarn` and `ProjectIndex#compilationUnit` | JavaParser-only | Dispatch by extension to `LanguageParser`. `compilationUnit(Path)` stays public for the rollout window (returns `null` for `.kt`); narrowed to private under a follow-up issue once all callers migrate to `fileMetadata(Path)`. |
+| `UsageStrategy#metadataOrGet`, `ImplementationStrategy#metadataOrGet`, `TransitiveStrategy#metadataOrGet` (`(Path, ProjectIndex, JavaParser fallbackParser)`) | When `index == null`, calls `JavaParsers.parseOrWarn(fallbackParser, ...)` then `FileMetadataExtractor.extract(cu)`. JavaParser-typed fallback. | Reroute through `LanguageParsers.parseOrWarn(file, label)` driven by the file's extension. The `JavaParser fallbackParser` argument was **dropped outright** (the parameter was on a private method with no external surface — `@Deprecated` cushion was unnecessary); shipped in PR #2. |
+| `JavaParsers.parseOrWarn` and `ProjectIndex#compilationUnit` | JavaParser-only | `JavaParsers` collapses into `JavaLanguageParser` (deleted as a separate class). `ProjectIndex#compilationUnit(Path)` and `ProjectIndex#fileMetadata(Path)` both dispatch by extension via `LanguageParsers.forFile`. `compilationUnit(Path)` stays public for the rollout window (returns `null` for `.kt`); narrowing to private is tracked as a post-#76 follow-up once `ProjectIndexConcurrencyTest` + `ProjectIndexTest` migrate to `fileMetadata(Path)`. |
 
 The four strategies share most of their hot path through `FileMetadata`,
 but two caveats remain that the original plan oversold:
@@ -814,32 +814,87 @@ hint in `--explain` plus the bucket-label rename
   Top-level Kotlin functions named `Util.kt` select `UtilKtTest.kt`
   via the synthetic FQN.
 
-### PR #2 — `issue-76-language-parser-interface`
+### PR #2 — `issue-76-language-parser-interface` ✅ shipped
 **Scope:** Refactor + strategy fallback rewire. No observable behaviour
 change for Java (existing tests pass unchanged).
+
+**Status:** Shipped. Implemented as documented below with three minor
+divergences from the draft, all safe:
+
+1. The `metadataOrGet` private parameter was **dropped** rather than
+   kept as `@Deprecated`. The pre-PR-2 `JavaParser fallbackParser`
+   argument lived on a private method inside three strategy classes
+   — there is no caller outside the file, package-private or
+   otherwise, so the "@Deprecated for one release" cushion had no
+   external surface to protect. The parameter is gone in PR #2; new
+   call sites pass nothing.
+2. `JavaParsers` (package-private static utility) was **deleted**
+   rather than retained as a shim. Same argument: no external
+   surface, full source-of-truth ownership now lives in
+   `JavaLanguageParser`. The two test files that called
+   `JavaParsers.newParser()` for hand-built fixtures were updated to
+   `JavaLanguageParser.newParser()` in the same commit.
+3. `ProjectIndex#fileMetadata(Path)` was rewired to dispatch via
+   `LanguageParser` in PR #2 rather than deferring the split to
+   PR #3. The original draft had PR #2 leave `fileMetadata` as a
+   `compilationUnit → extract` Java-only chain with a forward-pointer
+   marker for PR #3. Adversarial review of the shipped PR #2 surfaced
+   a silent-drop trap in that shape: once PR #3 registered a
+   `KotlinLanguageParser`, a malformed `.kt` file would route through
+   `compilationUnit(Path)`, hit the `instanceof JavaLanguageParser`
+   gate, return `null` without bumping `parseFailureCount`, and
+   silently drop out of discovery without escalating to
+   `DISCOVERY_INCOMPLETE` — exactly the silent-drop class of bug
+   the counter exists to prevent. The fix is small (~15 lines): the
+   `fileMetadata` lambda branches on parser kind, routes Java
+   through `compilationUnit` (preserving the parse-once dedupe),
+   and routes non-Java through `parser.parseOrWarn(file, "index")`
+   directly with a `parseFailureCount.incrementAndGet()` on null.
+   PR #3 becomes registration-only for the routing infrastructure
+   (it still adds `KotlinLanguageParser` and the system-property
+   gate; it no longer needs to rewire any call site).
 
 - Extract `LanguageParser` interface as in Section 3.
 - Wrap `JavaParsers` as `JavaLanguageParser`; the
   `ThreadLocal<JavaParser>` in `ProjectIndex` moves inside
-  `JavaLanguageParser`.
-- `ProjectIndex` dispatches via the extension map; today the map only
-  contains `.java`. `compilationUnit(Path)` stays public (returns null
-  for non-Java extensions, but the map only contains `.java` until
-  PR #3).
+  `JavaLanguageParser`. `JavaParsers` is deleted (no external
+  callers).
+- `ProjectIndex.compilationUnit(Path)` dispatches via
+  `LanguageParsers.forFile`; today the map only contains `.java`,
+  so `compilationUnit(Path)` returns `null` for any other extension.
+- `ProjectIndex.fileMetadata(Path)` also dispatches via
+  `LanguageParsers.forFile`; Java parses route through
+  `compilationUnit(Path)` (preserving the per-file CU cache dedupe
+  with `compilationUnit` consumers); non-Java parses route through
+  `LanguageParser.parseOrWarn(file, "index")` directly and bump
+  `parseFailureCount` on null. This is the divergence-from-draft
+  in **Status** item 3 above — PR #2 owns the dispatch shape so
+  PR #3's parser-failure invariants come along for free.
 - **Strategy no-index fallbacks** (`UsageStrategy.metadataOrGet`,
   `ImplementationStrategy.metadataOrGet`, `TransitiveStrategy.metadataOrGet`)
-  reroute through `LanguageParser.parseOrWarn(file, label)`. Public
-  signatures stay backwards-compatible by keeping the
-  `JavaParser fallbackParser` parameter as `@Deprecated` (unused) for
-  one release; new callers pass null.
+  reroute through `LanguageParsers.parseOrWarn(file, label)`.
+  `metadataOrGet` is private; the deprecation cushion was unnecessary
+  and the `JavaParser fallbackParser` parameter was dropped outright.
 - All existing tests pass unchanged. Functionally a refactor; the
   load-bearing change is the strategy-fallback rewire that the
-  original draft missed and that is required for Kotlin files to
-  route correctly through any no-index entry point.
+  original draft missed (required for Kotlin files to route
+  correctly through any no-index entry point) plus the
+  `fileMetadata` split (required so PR #3 doesn't silently drop
+  malformed `.kt` files past `DISCOVERY_INCOMPLETE`).
+
+**Adopter-visible result:** Zero. No `--explain` strings change, no
+new dependencies, no schema bump, no behaviour difference for any
+Java diff. The PR's whole job is to set up the dispatch
+infrastructure that PR #3 will plug `KotlinLanguageParser` into.
 
 ### PR #3 — `issue-76-kotlin-language-parser` (system-property-gated)
 **Scope:** Add the embeddable, the Kotlin parser, the shading rules,
 behind `affected-tests.kotlin.enabled` system property (default `false`).
+The dispatch infrastructure is already in place from PR #2 — registering
+`.kt` → `KotlinLanguageParser` in `LanguageParsers.BY_EXTENSION` is
+the only call-site change needed; `ProjectIndex.fileMetadata` already
+routes non-Java parsers correctly (with the `parseFailureCount` bump
+on null), and the strategy fallbacks already dispatch by extension.
 
 - New dep on `kotlin-compiler-embeddable` (`compileOnly` in core,
   `implementation` in gradle — see Section 4).
