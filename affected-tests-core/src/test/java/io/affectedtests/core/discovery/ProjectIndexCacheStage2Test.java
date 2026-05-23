@@ -150,7 +150,7 @@ class ProjectIndexCacheStage2Test {
         // contract is "round-tripped data agrees with re-extraction
         // of the live file", which is the universal invariant.
         FileMetadata fooFresh = FileMetadataExtractor.extract(
-                JavaParsers.newParser().parse(foo).getResult().orElseThrow());
+                JavaLanguageParser.newParser().parse(foo).getResult().orElseThrow());
         assertEquals(fooFresh.imports(), fooReloaded.imports());
         assertEquals(fooFresh.typeDeclarations(), fooReloaded.typeDeclarations());
     }

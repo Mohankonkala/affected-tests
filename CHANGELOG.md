@@ -6,6 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — `LanguageParser` dispatch (issue #76, PR #2 of Phase 2)
+
+Refactor only — zero adopter-visible behaviour change for Java diffs.
+Pre-PR-2 the discovery pipeline hard-coded `JavaParser` everywhere a
+source file needed parsing: `ProjectIndex.compilationUnit` carried a
+`static ThreadLocal<JavaParser>`, the three index-aware strategies
+(`UsageStrategy`, `ImplementationStrategy`, `TransitiveStrategy`)
+each took a `JavaParser fallbackParser` argument on their no-index
+fallback path, and a `JavaParsers` static utility owned the
+language-level constant. PR #1 widened the scanner to admit `.kt`
+files but every parser-side site still assumed Java; the temporary
+short-circuit in `ProjectIndex.compilationUnit` was the only thing
+preventing a `DISCOVERY_INCOMPLETE` cascade on every Kotlin diff,
+flagged with a grep-able PR #1 marker.
+
+PR #2 introduces a small `LanguageParser` interface
+(`io.affectedtests.core.discovery.LanguageParser`) with a single
+operation — `parseOrWarn(Path, String) -> FileMetadata` — and a
+package-private `LanguageParsers` registry mapping file extensions
+to their parser implementations. `JavaParsers` collapses into a
+`JavaLanguageParser` that owns the per-thread `JavaParser` instance
+and exposes the canonical language-level constant. Both
+`ProjectIndex.compilationUnit` and `ProjectIndex.fileMetadata`
+dispatch through the registry; the strategy fallbacks
+(`UsageStrategy`, `ImplementationStrategy`, `TransitiveStrategy`)
+also route through `LanguageParsers.parseOrWarn`. The PR #1
+short-circuit and its grep marker are gone. The only test changes
+are the two fixtures (`FileMetadataExtractorTest`,
+`ProjectIndexCacheStage2Test`) that called `JavaParsers.newParser()`
+directly — both moved to `JavaLanguageParser.newParser()` with no
+behaviour change.
+
+`ProjectIndex.fileMetadata` is the load-bearing addition that the
+original draft deferred to PR #3. Adversarial review surfaced a
+silent-drop trap in the deferred shape: once PR #3 registered a
+`KotlinLanguageParser`, a malformed `.kt` file would route through
+`compilationUnit(Path)`, hit the JavaParser-only `instanceof` gate,
+return `null` without bumping `parseFailureCount`, and silently
+drop out of discovery without escalating to
+`DISCOVERY_INCOMPLETE` — the exact failure mode the counter exists
+to surface. Pulling the `fileMetadata` split into PR #2 closes the
+trap structurally: the `parseFailureCount` bump now lives in two
+partitioned sites (Java parses bump inside `compilationUnit`,
+non-Java parses bump inside `fileMetadata`'s non-Java branch),
+both inside `ProjectIndex` so the parallel-discovery dedupe
+guarantees from issue #42 still hold.
+
+PR #3 of the rollout will register a `KotlinLanguageParser` for
+`.kt` (gated on `-Daffected-tests.kotlin.enabled=true`) without
+touching any call site this PR rewired — adding `.kt` to
+`LanguageParsers.BY_EXTENSION` is the only registry edit needed,
+and the `parseFailureCount` invariant for malformed Kotlin comes
+along for free. PR #4 flips the flag default. The no-index
+fallback paths previously used by unit tests now route through
+the registry too — a `.kt` file fed to a strategy outside an
+index context returns `null` (skip) cleanly instead of crashing
+JavaParser.
+
 ### Added — Kotlin path-derived mapping (issue #76 / #47, PR #1 of Phase 2)
 
 Kotlin (`.kt`) sources are now first-class participants in the

@@ -184,6 +184,67 @@ class ProjectIndexTest {
         // promises.
         assertNull(index.fileMetadata(kotlin),
                 "fileMetadata(.kt) must follow compilationUnit's null contract");
+        // PR #2 fileMetadata rewire pins this explicitly: the
+        // dispatch through LanguageParsers.forFile returns null for
+        // an unregistered extension, and the early-return out of
+        // the lambda does NOT bump parseFailureCount. Without this
+        // assertion a future regression where the no-parser branch
+        // accidentally started bumping (e.g. someone refactors the
+        // dispatch to "if parser unknown, log and bump as defense
+        // in depth") would silently surface DISCOVERY_INCOMPLETE on
+        // every Kotlin diff again — exactly the failure mode the
+        // PR #1 short-circuit + PR #2 dispatch were both designed
+        // to prevent.
+        assertEquals(0, index.parseFailureCount(),
+                "fileMetadata(.kt) must NOT increment parseFailureCount for "
+                        + "an unregistered extension (the file is unparsed-by-design, "
+                        + "not a parse failure). Got: " + index.parseFailureCount());
+    }
+
+    @Test
+    void fileMetadataBumpsParseFailureCountForJavaParseFailure() throws Exception {
+        // PR #2 of issue #76 fileMetadata rewire pins the Java-side
+        // bump invariant: a malformed .java file accessed through
+        // fileMetadata(Path) — not just compilationUnit(Path) —
+        // must bump parseFailureCount. Both methods route through
+        // the same compilationUnit-cached parse for Java, so a
+        // strategy that consumes fileMetadata directly (the index-
+        // driven hot path) must surface the same parse-failure
+        // signal as the lower-level compilationUnit call.
+        //
+        // Companion to parseFailureCountIncrementsOnUnparseableFile
+        // (which exercises the compilationUnit entry point). This
+        // test enters via fileMetadata, the public surface every
+        // strategy actually uses, so a regression that broke the
+        // bump only on the fileMetadata path would still go red.
+        Path prod = projectDir.resolve("src/main/java/com/example/Foo.java");
+        writeJava(prod, "package com.example; public class Foo {}");
+        Path broken = projectDir.resolve("src/main/java/com/example/Broken.java");
+        writeJava(broken, "package com.example; public class Broken {");
+
+        AffectedTestsConfig config = AffectedTestsConfig.builder().mode(Mode.CI).build();
+        ProjectIndex index = ProjectIndex.build(projectDir, config);
+
+        assertNotNull(index.fileMetadata(prod),
+                "Valid source must still produce metadata via fileMetadata");
+        assertNull(index.fileMetadata(broken),
+                "Malformed source must surface as null FileMetadata");
+        assertEquals(1, index.parseFailureCount(),
+                "Broken file accessed via fileMetadata must bump parseFailureCount "
+                        + "exactly once (the Java branch shares the compilationUnit "
+                        + "cache so the bump is de-duplicated across the two entry "
+                        + "points)");
+
+        // De-dup contract: re-asking via either entry point must
+        // not double-count. PR #2's fileMetadata routes Java
+        // through compilationUnit() so the metadataCache and the
+        // cuCache share the parse-once guarantee.
+        index.fileMetadata(broken);
+        index.compilationUnit(broken);
+        index.fileMetadata(broken);
+        assertEquals(1, index.parseFailureCount(),
+                "Repeat reads via mixed fileMetadata + compilationUnit "
+                        + "entry points must still report exactly one failure");
     }
 
     private static void writeJava(Path target, String body) throws Exception {

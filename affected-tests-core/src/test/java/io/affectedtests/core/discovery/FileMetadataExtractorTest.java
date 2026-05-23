@@ -63,7 +63,7 @@ class FileMetadataExtractorTest {
                     + ".java";
             Path file = tmp.resolve(fileName);
             Files.writeString(file, source);
-            JavaParser parser = JavaParsers.newParser();
+            JavaParser parser = JavaLanguageParser.newParser();
             ParseResult<CompilationUnit> result = parser.parse(file);
             assertTrue(result.isSuccessful(), () -> "Parse failed: " + result.getProblems());
             CompilationUnit cu = result.getResult().orElseThrow();
@@ -417,7 +417,7 @@ class FileMetadataExtractorTest {
                 @Deprecated
                 package com.example;
                 """);
-        JavaParser parser = JavaParsers.newParser();
+        JavaParser parser = JavaLanguageParser.newParser();
         ParseResult<CompilationUnit> result = parser.parse(file);
         assertTrue(result.isSuccessful(), () -> "Parse failed: " + result.getProblems());
         FileMetadata md = FileMetadataExtractor.extract(result.getResult().orElseThrow());

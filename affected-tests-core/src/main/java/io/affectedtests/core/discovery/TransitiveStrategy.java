@@ -1,7 +1,5 @@
 package io.affectedtests.core.discovery;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ast.CompilationUnit;
 import io.affectedtests.core.config.AffectedTestsConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -145,8 +143,6 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
             return discoveredTests;
         }
 
-        JavaParser fallbackParser = (index == null) ? JavaParsers.newParser() : null;
-
         // Cheap path-derived FQN map. Used for resolution only; built
         // once and reused across BFS depths. {@code extraKnownFqns}
         // (== changedProductionClasses) is unioned in so reverse edges
@@ -188,7 +184,7 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
         for (int depth = 1; depth <= config.transitiveDepth(); depth++) {
             Set<String> nextLevel = expandFrontier(
                     currentLevel, textIndex, fqnToFile, allKnownFqns,
-                    allVisited, index, fallbackParser);
+                    allVisited, index);
 
             if (nextLevel.isEmpty()) {
                 log.debug("[transitive] No more downstream types at depth {}", depth);
@@ -237,8 +233,7 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
                                        Map<String, Path> fqnToFile,
                                        Set<String> allKnownFqns,
                                        Set<String> allVisited,
-                                       ProjectIndex index,
-                                       JavaParser fallbackParser) {
+                                       ProjectIndex index) {
         Set<String> nextLevel = new LinkedHashSet<>();
 
         // Group the frontier by simple name so we collect candidate
@@ -276,7 +271,7 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
                 // explicit `!resolvedFqn.equals(classFqn)` check.
                 if (targetFqnsForName.contains(candidateFqn)) continue;
 
-                FileMetadata md = metadataOrGet(candidate, index, fallbackParser);
+                FileMetadata md = metadataOrGet(candidate, index);
                 if (md == null) continue;
 
                 Set<String> resolvedTargets = resolveReferencesToFrontier(
@@ -383,12 +378,11 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
         return null;
     }
 
-    private FileMetadata metadataOrGet(Path file, ProjectIndex index, JavaParser fallbackParser) {
+    private FileMetadata metadataOrGet(Path file, ProjectIndex index) {
         if (index != null) {
             return index.fileMetadata(file);
         }
-        CompilationUnit cu = JavaParsers.parseOrWarn(fallbackParser, file, "transitive");
-        return cu == null ? null : FileMetadataExtractor.extract(cu);
+        return LanguageParsers.parseOrWarn(file, "transitive");
     }
 
     private String pathToFqn(Path file) {
@@ -417,9 +411,9 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
      *
      * <p>Files that fail to read (I/O error, missing file due to
      * concurrent {@code git rm}) are logged at debug and skipped —
-     * the same posture {@code JavaParsers.parseOrWarn} takes on
-     * malformed source. A skipped file simply doesn't contribute
-     * candidate edges; it does not crash the walk.
+     * the same posture {@link JavaLanguageParser#compilationUnit}
+     * takes on malformed source. A skipped file simply doesn't
+     * contribute candidate edges; it does not crash the walk.
      */
     static final class SimpleNameTextIndex {
         private final Map<String, Set<Path>> simpleNameToFiles;

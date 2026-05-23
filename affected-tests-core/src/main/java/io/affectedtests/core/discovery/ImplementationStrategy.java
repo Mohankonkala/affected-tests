@@ -1,7 +1,5 @@
 package io.affectedtests.core.discovery;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ast.CompilationUnit;
 import io.affectedtests.core.config.AffectedTestsConfig;
 import io.affectedtests.core.util.LogSanitizer;
 import org.slf4j.Logger;
@@ -143,8 +141,6 @@ public final class ImplementationStrategy implements TestDiscoveryStrategy {
         // pass adds nothing new, or when depth hits the configured
         // transitiveDepth (reused as a sanity bound — in practice Java
         // hierarchies are 2-3 deep).
-        JavaParser fallbackParser = (index == null) ? JavaParsers.newParser() : null;
-
         // Deep-copy the inner sets so the fixpoint loop's subsequent
         // `.add(implFqn)` calls don't leak mutations into
         // simpleNameToFqns. The latter is unused after this point
@@ -156,7 +152,7 @@ public final class ImplementationStrategy implements TestDiscoveryStrategy {
         for (int depth = 0; depth < depthCap; depth++) {
             Set<String> newImpls = new LinkedHashSet<>();
             for (Path sourceFile : sourceFiles) {
-                FileMetadata md = metadataOrGet(sourceFile, index, fallbackParser);
+                FileMetadata md = metadataOrGet(sourceFile, index);
                 if (md == null) continue;
 
                 // Per-file metadata carries every TypeDeclaration in the
@@ -221,20 +217,33 @@ public final class ImplementationStrategy implements TestDiscoveryStrategy {
 
     /**
      * Resolves the {@link FileMetadata} for {@code file}.
-     * <p>Index-backed path returns the cached record from
-     * {@link ProjectIndex#fileMetadata(Path)} — Stage&nbsp;2 of
-     * issue&nbsp;#41 lets the warm path do zero parsing.
-     * <p>Standalone path parses with {@code fallbackParser} and runs
-     * the extractor inline, preserving the no-index entry point used
-     * by the {@code projectDir} constructor and a handful of unit
-     * tests.
+     * <p>Index-backed path (the engine-level run) returns the cached
+     * record from {@link ProjectIndex#fileMetadata(Path)} —
+     * Stage&nbsp;2 of issue&nbsp;#41 lets the warm path do zero
+     * parsing.
+     * <p>Standalone path (unit tests + the legacy
+     * {@code projectDir}-based entry point) dispatches via
+     * {@link LanguageParsers#parseOrWarn} which looks up the parser
+     * for {@code file}'s extension and produces {@link FileMetadata}
+     * directly. Pays the parse cost every time but keeps the
+     * strategy independent from {@link ProjectIndex} for tests that
+     * don't want the index plumbing.
+     *
+     * <p>Pre-PR-2 of issue #76 this method took a
+     * {@code JavaParser fallbackParser} argument and hard-coded
+     * Java-only parsing in the standalone branch — even after PR #1
+     * widened the scanner to admit {@code .kt} files. Post-PR-2 the
+     * dispatch is extension-driven, so a {@code .kt} test file
+     * fed to the standalone path will reach the (still-absent
+     * pre-PR-3) Kotlin parser and silently drop out via
+     * {@code null}, matching the contract every other parser-side
+     * call site already has.
      */
-    private FileMetadata metadataOrGet(Path file, ProjectIndex index, JavaParser fallbackParser) {
+    private FileMetadata metadataOrGet(Path file, ProjectIndex index) {
         if (index != null) {
             return index.fileMetadata(file);
         }
-        CompilationUnit cu = JavaParsers.parseOrWarn(fallbackParser, file, "impl");
-        return cu == null ? null : FileMetadataExtractor.extract(cu);
+        return LanguageParsers.parseOrWarn(file, "impl");
     }
 
     /**
