@@ -187,7 +187,12 @@ class ProjectIndexCacheStage2Test {
         // the next run takes the schema-mismatch invalidation path
         // forever and the cache never warms up. PR #1 of issue #76
         // bumped the schema 2 → 3 to invalidate stale Java-only
-        // testFqn universes on mixed Java + Kotlin projects.
+        // testFqn universes on mixed Java + Kotlin projects; PR #3
+        // bumps 3 → 4 to invalidate the on-disk row format ahead of
+        // the Kotlin AST parser shipping its first FileMetadata rows
+        // (even with the rollout flag default-off, a CI worker that
+        // flipped the property once must not surface a half-Kotlin
+        // -shaped cache to a worker that ran with the property off).
         writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
                 "package com.example; public class FooTest {}");
 
@@ -198,8 +203,8 @@ class ProjectIndexCacheStage2Test {
         Path snapshot = projectDir.resolve("build/affected-tests/index/v1/snapshot.tsv");
         assertTrue(Files.isRegularFile(snapshot));
         String contents = Files.readString(snapshot);
-        assertTrue(contents.contains("v\t3"),
-                "Persisted snapshot must declare current schema version (3 since PR #1 of issue #76)");
+        assertTrue(contents.contains("v\t4"),
+                "Persisted snapshot must declare current schema version (4 since PR #3 of issue #76)");
 
         ProjectIndex second = ProjectIndex.build(projectDir, BASE_CONFIG);
         assertEquals(first.testFqns(), second.testFqns(),

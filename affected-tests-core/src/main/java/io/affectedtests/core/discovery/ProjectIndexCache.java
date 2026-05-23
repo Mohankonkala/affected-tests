@@ -118,19 +118,37 @@ public final class ProjectIndexCache {
      * <p>{@code v3} (PR #1 of issue #76, Phase 2 Kotlin AST):
      * {@link SourceFileScanner} now collects {@code .kt} files
      * alongside {@code .java} under every configured source / test
-     * dir. The on-disk row format does not change, but
+     * dir. The on-disk row format did not change, but
      * {@link #configHash(io.affectedtests.core.config.AffectedTestsConfig)}
      * hashes only the declared dir-list strings — not the
      * file-extension scope the scanner applies inside those dirs —
      * so a pre-PR-1 cache from a mixed Java + Kotlin project is
      * functionally stale: its {@code testFqnToPath} universe is
-     * missing every Kotlin test FQN. Bumping the schema is the only
-     * mechanism that guarantees a clean rescan on warm caches across
-     * the upgrade boundary. PR #3 (full Kotlin AST persistence)
-     * bumps to {@code v4} when the row format itself changes.
+     * missing every Kotlin test FQN. Bumping the schema was the only
+     * mechanism that guaranteed a clean rescan on warm caches across
+     * the upgrade boundary.
+     *
+     * <p>{@code v4} (PR #3 of issue #76, Phase 2 Kotlin AST):
+     * marker bump that establishes a hard upgrade boundary
+     * independent of {@code configHash}. The wire format in v=4
+     * is byte-compatible with v=3 — the {@code m} row layout did
+     * not change in this PR. Cross-flag invalidation (e.g. a CI
+     * worker that flipped {@code -Daffected-tests.kotlin.enabled}
+     * once for a smoke test must not feed a half-Kotlin-shaped
+     * cache to a worker that ran with the property off) is
+     * delegated to the {@code |kotlinEnabled:<bool>} term added
+     * to {@link #configHash(io.affectedtests.core.config.AffectedTestsConfig)}
+     * in this same PR, which is mathematically sufficient for
+     * every flag-flip scenario. The schema bump itself is a
+     * forward-looking defensive marker: PR #4's flag-flip plus
+     * any future shape change to {@code m} rows (e.g. honouring
+     * {@code @file:JvmName}, adding sealed-hierarchy supertype
+     * lists) will piggyback on a v=5 bump rather than rely on
+     * {@code configHash} to catch the rewire. The trade-off is
+     * one CI cache-miss per adopter on the v=3→v=4 upgrade.
      * See {@code docs/PHASE-2-KOTLIN-AST.md} §7.
      */
-    static final int SCHEMA_VERSION = 3;
+    static final int SCHEMA_VERSION = 4;
 
     private static final String CACHE_DIR_REL = "build/affected-tests/index/v1";
     private static final String SNAPSHOT_FILE = "snapshot.tsv";
@@ -223,7 +241,7 @@ public final class ProjectIndexCache {
         if (!verifyDirs(loaded.dirSnapshots)) {
             return Optional.empty();
         }
-        ProjectIndex index = materialise(loaded);
+        ProjectIndex index = materialise(loaded, config);
         int metadataSeeded = seedFileMetadata(index, loaded.fileMetadataRows);
         log.info("ProjectIndex cache HIT: {} source files, {} test files, {} test FQNs, {} source FQNs"
                         + " (per-file metadata seeded: {} of {})",
@@ -514,6 +532,16 @@ public final class ProjectIndexCache {
         appendList(sb, config.outOfScopeSourceDirs());
         sb.append("|outOfScopeTestDirs:");
         appendList(sb, config.outOfScopeTestDirs());
+        // Issue #76 PR #3 — Kotlin AST gate participates in the hash so
+        // a flip across consecutive runs forces a full rescan. Without
+        // this, a worker that ran once with -Daffected-tests.kotlin.enabled=true
+        // and persisted Kotlin {@code m} rows would have its cache reused
+        // by a subsequent worker running with the flag off — the off-mode
+        // strategies would then consume Kotlin FileMetadata they were not
+        // configured to expect. The schema bump (v3 → v4) catches the
+        // row-shape change across the PR boundary; this hash term catches
+        // the same-binary, same-cache, different-flag-value case.
+        sb.append("|kotlinEnabled:").append(config.kotlinEnabled());
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             byte[] digest = md.digest(sb.toString().getBytes(StandardCharsets.UTF_8));
@@ -544,7 +572,7 @@ public final class ProjectIndexCache {
 
     // ── Materialisation ─────────────────────────────────────────────────
 
-    private static ProjectIndex materialise(Snapshot s) {
+    private static ProjectIndex materialise(Snapshot s, AffectedTestsConfig config) {
         List<Path> sourceFiles = new ArrayList<>(s.sourceFiles.size());
         for (String p : s.sourceFiles) sourceFiles.add(Path.of(p));
         List<Path> testFiles = new ArrayList<>(s.testFiles.size());
@@ -573,7 +601,7 @@ public final class ProjectIndexCache {
         }
         ScannedDirs dirs = new ScannedDirs(reconstructedRoots, List.of());
 
-        return ProjectIndex.fromCache(sourceFiles, testFiles, testFqnToPath, sourceFqns, dirs);
+        return ProjectIndex.fromCache(sourceFiles, testFiles, testFqnToPath, sourceFqns, dirs, config);
     }
 
     // ── On-disk schema ──────────────────────────────────────────────────
@@ -611,7 +639,28 @@ public final class ProjectIndexCache {
                 String type = line.substring(0, firstSep);
                 String rest = line.substring(firstSep + 1);
                 switch (type) {
-                    case "v"     -> s.schemaVersion = Integer.parseInt(rest);
+                    case "v"     -> {
+                        s.schemaVersion = Integer.parseInt(rest);
+                        // Short-circuit on schema mismatch — both
+                        // forward-incompatibility (a future v=5
+                        // body would surface as
+                        // {@link UncheckedIOException} from
+                        // {@link DirSnapshot#parse} or as a silent
+                        // null-row drop in {@link FileMetadataRow#parse},
+                        // both of which obscure the actual cause)
+                        // and backward-incompatibility (a v=3 body
+                        // whose shape changed in v=4) bail out
+                        // here. The caller's schema check at
+                        // {@link #tryLoad} then logs the canonical
+                        // "schemaVersion mismatch" line. Relies on
+                        // {@link Snapshot#write} writing the
+                        // {@code v\t...} line as the first
+                        // non-comment line in the snapshot, which
+                        // it does — see {@link Snapshot#write}.
+                        if (s.schemaVersion != SCHEMA_VERSION) {
+                            return s;
+                        }
+                    }
                     case "cfg"   -> s.configHash = rest;
                     case "d"     -> s.dirSnapshots.add(DirSnapshot.parse(rest));
                     case "sf"    -> s.sourceFiles.add(rest);

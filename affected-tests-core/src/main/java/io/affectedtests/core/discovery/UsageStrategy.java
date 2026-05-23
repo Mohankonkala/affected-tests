@@ -130,7 +130,17 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
         if (index != null) {
             return index.fileMetadata(file);
         }
-        return LanguageParsers.parseOrWarn(file, "usage");
+        // Standalone fallback (no engine-supplied registry):
+        // {@link LanguageParsers#defaultJavaOnly()} is the safe-no-Kotlin
+        // posture. PR #3 made the registry per-engine because Kotlin
+        // owns lifecycle state that must be disposed; a unit test
+        // driving the strategy directly does not have that lifecycle
+        // and must not be required to construct + dispose one. {@code .kt}
+        // files routed through this path silently drop with no WARN
+        // (the {@code defaultJavaOnly} registry has no parser registered
+        // for {@code .kt}, so {@code parseOrWarn} returns {@code null}
+        // immediately) — matching the pre-PR-3 contract.
+        return LanguageParsers.defaultJavaOnly().parseOrWarn(file, "usage");
     }
 
     /**

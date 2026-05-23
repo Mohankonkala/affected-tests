@@ -29,13 +29,27 @@ import java.util.function.Predicate;
  * {@link com.github.javaparser.JavaParser} (JavaParser's mutable
  * parser-config and symbol-resolver state make a single shared parser
  * unsafe to invoke concurrently); PR #3's {@code KotlinLanguageParser}
- * will own a single shared {@code KotlinCoreEnvironment} per
+ * owns a single shared {@code KotlinCoreEnvironment} per
  * {@link ProjectIndex} with PSI traversals wrapped in
  * {@code runReadAction}. Callers still MUST NOT use the returned CU
  * from multiple threads concurrently — that's a JavaParser AST
  * constraint that no amount of cache wrapping can paper over.
+ *
+ * <p>Each {@link ProjectIndex} owns its own {@link LanguageParsers}
+ * registry — Java-only by default, or Java + Kotlin when the config
+ * sets {@link io.affectedtests.core.config.AffectedTestsConfig#kotlinEnabled()}
+ * to {@code true}. The registry's lifecycle is bound to the index's:
+ * {@link #close()} disposes any per-engine parser resources (notably
+ * Kotlin's {@code KotlinCoreEnvironment} parent {@code Disposable}).
+ * Callers are expected to wrap engine-scoped uses in try-with-resources;
+ * the engine ({@link io.affectedtests.core.AffectedTestsEngine#discover})
+ * already does. Tests that build a {@link ProjectIndex} ad-hoc and
+ * never set the Kotlin flag pay no cost for skipping {@code close()},
+ * but doing so is recommended for forward-compatibility — once the
+ * rollout flag flips on by default in PR #4, any caller that leaks
+ * a {@link ProjectIndex} leaks a {@code KotlinCoreEnvironment} too.
  */
-public final class ProjectIndex {
+public final class ProjectIndex implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectIndex.class);
 
@@ -169,14 +183,36 @@ public final class ProjectIndex {
      */
     private final AtomicInteger parseFailureCount = new AtomicInteger();
 
+    /**
+     * Per-engine registry of {@link LanguageParser}s, shaped by the
+     * config that built this index. Defaults to a Java-only registry
+     * when no per-config registry is supplied (the legacy
+     * constructor path used by tests that build an index for
+     * non-Kotlin scenarios). The registry is disposed by
+     * {@link #close()}.
+     */
+    private final LanguageParsers languageParsers;
+
     private ProjectIndex(List<Path> sourceFiles, List<Path> testFiles,
                          Map<String, Path> testFqnToPath, Set<String> sourceFqns,
-                         ProjectIndexCache.ScannedDirs scannedDirs) {
+                         ProjectIndexCache.ScannedDirs scannedDirs,
+                         LanguageParsers languageParsers) {
         this.sourceFiles = sourceFiles;
         this.testFiles = testFiles;
         this.testFqnToPath = testFqnToPath;
         this.sourceFqns = sourceFqns;
         this.scannedDirs = scannedDirs;
+        // Defensive default: ad-hoc test-tree builders that bypass
+        // the {@link #build(Path, AffectedTestsConfig)} factory and
+        // call the {@link ProjectIndexCache} materialise path
+        // (cache-hit shape) get the Java-only singleton — the
+        // shape every pre-PR-3 caller had. Production cache hits
+        // route through {@link ProjectIndexCache#materialise}
+        // which now also threads the per-config registry through
+        // (see ProjectIndexCache.tryLoad → materialise → here).
+        this.languageParsers = languageParsers != null
+                ? languageParsers
+                : LanguageParsers.defaultJavaOnly();
     }
 
     public static ProjectIndex build(Path projectDir, AffectedTestsConfig config) {
@@ -262,7 +298,8 @@ public final class ProjectIndex {
                 Collections.unmodifiableList(testFiles),
                 Collections.unmodifiableMap(testFqnToPath),
                 Collections.unmodifiableSet(sourceFqns),
-                dirs
+                dirs,
+                LanguageParsers.forConfig(config)
         );
 
         if (Boolean.parseBoolean(System.getProperty("affected-tests.indexCache.enabled", "true"))) {
@@ -279,18 +316,26 @@ public final class ProjectIndex {
      * index does — the cache stores derived data, not parser state, so
      * the first {@code compilationUnit(file)} call on a cached index
      * still parses on demand.
+     *
+     * <p>The {@code config} parameter shapes the per-engine
+     * {@link LanguageParsers} registry — the cache reload path must
+     * land on the same registry shape a fresh build would, otherwise
+     * a Kotlin-enabled cache hit would surface a Java-only registry
+     * to the strategies.
      */
     static ProjectIndex fromCache(List<Path> sourceFiles,
                                   List<Path> testFiles,
                                   LinkedHashMap<String, Path> testFqnToPath,
                                   Set<String> sourceFqns,
-                                  ProjectIndexCache.ScannedDirs scannedDirs) {
+                                  ProjectIndexCache.ScannedDirs scannedDirs,
+                                  AffectedTestsConfig config) {
         return new ProjectIndex(
                 Collections.unmodifiableList(sourceFiles),
                 Collections.unmodifiableList(testFiles),
                 Collections.unmodifiableMap(testFqnToPath),
                 Collections.unmodifiableSet(sourceFqns),
-                scannedDirs
+                scannedDirs,
+                LanguageParsers.forConfig(config)
         );
     }
 
@@ -386,7 +431,7 @@ public final class ProjectIndex {
      */
     public CompilationUnit compilationUnit(Path file) {
         Optional<CompilationUnit> entry = cuCache.computeIfAbsent(file, key -> {
-            LanguageParser parser = LanguageParsers.forFile(key);
+            LanguageParser parser = languageParsers.forFile(key);
             if (!(parser instanceof JavaLanguageParser jlp)) {
                 // Either no parser registered for this extension
                 // (e.g. .kt pre-PR-3, .kts, .groovy, .scala) or a
@@ -436,7 +481,7 @@ public final class ProjectIndex {
      */
     public FileMetadata fileMetadata(Path file) {
         Optional<CachedMetadata> entry = metadataCache.computeIfAbsent(file, key -> {
-            LanguageParser parser = LanguageParsers.forFile(key);
+            LanguageParser parser = languageParsers.forFile(key);
             if (parser == null) {
                 // No registered parser for this extension (e.g.
                 // {@code .kts}, {@code .groovy}, {@code .scala}, or
@@ -608,5 +653,32 @@ public final class ProjectIndex {
      */
     public int parsedFileCount() {
         return cuCache.size();
+    }
+
+    /**
+     * Releases per-engine parser resources held by this index's
+     * {@link LanguageParsers} registry — notably Kotlin's shared
+     * {@code KotlinCoreEnvironment} parent {@link
+     * com.intellij.openapi.Disposable Disposable} when the rollout
+     * flag is on.
+     *
+     * <p>Idempotent: a second {@code close()} is a no-op so a
+     * try-with-resources guard wrapping a method that itself
+     * defensively closes does not double-dispose. Java parsers are
+     * thread-locals shared across every engine run for the JVM's
+     * lifetime, so closing a Java-only registry is also a no-op —
+     * making this method safe to call from any caller without first
+     * checking the rollout flag value.
+     *
+     * <p>The engine ({@code AffectedTestsEngine#discover}) wraps
+     * its {@link #build(Path, AffectedTestsConfig)} call in
+     * try-with-resources. Tests that build an index ad-hoc are
+     * encouraged to do the same once the Kotlin rollout flag flips
+     * default-on in PR #4 — until then leaking a Java-only registry
+     * has zero adopter cost.
+     */
+    @Override
+    public void close() {
+        languageParsers.close();
     }
 }

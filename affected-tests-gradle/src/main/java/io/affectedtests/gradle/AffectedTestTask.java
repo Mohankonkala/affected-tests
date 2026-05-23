@@ -156,6 +156,25 @@ public abstract class AffectedTestTask extends DefaultTask {
     public abstract Property<Boolean> getParallelDiscovery();
 
     /**
+     * Whether to register the Kotlin AST parser for {@code .kt} files
+     * (issue #76 Phase 2, PR #3). Default {@code false} during the
+     * rollout window; PR #4 flips the default. Wired from the
+     * {@code kotlinEnabled} extension property; can also be set
+     * per-invocation via the system property
+     * {@code -Daffected-tests.kotlin.enabled=true} (read at task-
+     * execution time via
+     * {@link org.gradle.api.provider.ProviderFactory#systemProperty}
+     * for configuration-cache safety). The flag value participates
+     * in the project-index cache hash so a flip across consecutive
+     * runs forces a clean rescan rather than reusing rows the new
+     * flag value would not produce.
+     *
+     * @return the Kotlin-enabled property
+     */
+    @Input
+    public abstract Property<Boolean> getKotlinEnabled();
+
+    /**
      * Suffixes used by the naming strategy to find test classes.
      * Default: {@code ["Test", "IT", "ITTest", "IntegrationTest"]}.
      *
@@ -509,7 +528,8 @@ public abstract class AffectedTestTask extends DefaultTask {
                 .testTaskNames(getTestTaskNames().get())
                 .includeImplementationTests(getIncludeImplementationTests().get())
                 .implementationNaming(getImplementationNaming().get())
-                .parallelDiscovery(getParallelDiscovery().getOrElse(true));
+                .parallelDiscovery(getParallelDiscovery().getOrElse(true))
+                .kotlinEnabled(getKotlinEnabled().getOrElse(false));
 
         if (getIgnorePaths().isPresent() && !getIgnorePaths().get().isEmpty()) {
             builder.ignorePaths(getIgnorePaths().get());

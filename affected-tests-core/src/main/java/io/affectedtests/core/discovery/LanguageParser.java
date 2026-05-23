@@ -27,20 +27,31 @@ import java.nio.file.Path;
  * <p>Implementations must be thread-safe for parallel discovery
  * (issue #42's posture). The Java implementation owns a
  * {@link ThreadLocal} of {@code JavaParser} (parser instances mutate
- * their {@code ParserConfiguration} during parse). Kotlin will own a
+ * their {@code ParserConfiguration} during parse). Kotlin owns a
  * single shared {@code KotlinCoreEnvironment} per
- * {@link ProjectIndex} and wrap PSI traversals in
+ * {@link ProjectIndex} and wraps PSI traversals in
  * {@code runReadAction(...)} per the design in
  * {@code docs/PHASE-2-KOTLIN-AST.md} §3.4.
+ *
+ * <p>Implementations are {@link AutoCloseable} so a per-engine
+ * registry can shed any language-specific resources at engine
+ * shutdown. The default {@link #close()} is a no-op (Java has nothing
+ * to dispose — its parsers are thread-locals collected with the
+ * thread). {@code KotlinLanguageParser} overrides to dispose its
+ * {@code parentDisposable}, which tears down the shared
+ * {@code KotlinCoreEnvironment} + MockApplication. Calling
+ * {@link #close()} more than once must be benign — the registry
+ * may close a parser twice on shutdown if a malformed config
+ * accidentally registers the same instance under two extensions.
  *
  * <p>Interface visibility is package-private on purpose. Only callers
  * inside {@code io.affectedtests.core.discovery} should look up
  * parsers; outside callers (the strategies, the engine) consume
  * {@link FileMetadata} via {@link ProjectIndex#fileMetadata(Path)}
- * or via the {@link LanguageParsers#parseOrWarn(Path, String)}
- * convenience for the standalone fallback path.
+ * or via {@link LanguageParsers#parseOrWarn(Path, String)} on the
+ * standalone fallback path.
  */
-interface LanguageParser {
+interface LanguageParser extends AutoCloseable {
 
     /**
      * The lowercase file extension this parser claims, including
@@ -74,4 +85,31 @@ interface LanguageParser {
      * logging).
      */
     FileMetadata parseOrWarn(Path file, String label);
+
+    /**
+     * Releases any per-engine resources the parser is holding. The
+     * default implementation is a no-op so {@link JavaLanguageParser}
+     * (whose state lives in {@code static ThreadLocal}s shared
+     * across every engine run for the JVM's life) does not need to
+     * override.
+     *
+     * <p>{@code KotlinLanguageParser} overrides this to dispose its
+     * {@code parentDisposable}, which in turn disposes the
+     * {@code KotlinCoreEnvironment} and the underlying
+     * MockApplication / extension-point registry. The plan
+     * (docs/PHASE-2-KOTLIN-AST.md §3.4) requires the disposal because
+     * a leaked MockApplication leaves multi-MB of pinned state on the
+     * Gradle-daemon classloader for the life of the daemon, plus the
+     * IntelliJ platform was not designed for many MockApplications
+     * coexisting in the same JVM.
+     *
+     * <p>Implementations must make this idempotent. {@link
+     * AutoCloseable#close()} declares {@code throws Exception} but
+     * implementations should swallow internal disposal failures into
+     * a {@code DEBUG} log line — a parser that fails to release its
+     * environment must not block engine shutdown.
+     */
+    @Override
+    default void close() {
+    }
 }

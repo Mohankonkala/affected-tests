@@ -887,7 +887,68 @@ new dependencies, no schema bump, no behaviour difference for any
 Java diff. The PR's whole job is to set up the dispatch
 infrastructure that PR #3 will plug `KotlinLanguageParser` into.
 
-### PR #3 — `issue-76-kotlin-language-parser` (system-property-gated)
+### PR #3 — `issue-76-kotlin-language-parser` (system-property-gated) — **SHIPPED**
+**Status:** Merged. Phase 2 PR #3 lands the Kotlin parser behind the
+`affected-tests.kotlin.enabled` system property (default `false` — every
+existing Java-only adopter sees zero behaviour change).
+
+**Outcome vs. plan:**
+
+- Embeddable wired in at `kotlin-compiler-embeddable:2.1.20`
+  (`compileOnly` in core, `implementation` in gradle as planned).
+- `KotlinLanguageParser` shipped under
+  `io.affectedtests.core.discovery` (package-private), owning the
+  `KotlinCoreEnvironment` lifecycle per Section 3.4. Single shared
+  environment per `ProjectIndex`, lazy bootstrap via double-checked
+  locking, fail-closed posture (single `WARN` + every `.kt` parse
+  in the run returns `null` + parse-failure counter participation +
+  `DISCOVERY_INCOMPLETE` escalation).
+- Shading + minimize block landed with relocation rules in the order
+  prescribed (more-specific first), plus path-based excludes for
+  the JS / Native / WASM / daemon / serialized-JS-or-Konan / WASM
+  bytecode-backend / Native bytecode-backend / FIR analysis / FIR
+  resolve / FIR backend / IR backend-JS / IR interpreter / IR inline
+  subsystems the JVM-PSI bootstrap doesn't reference. Prototype
+  build measures **55.7 MB** — well under the 60 MB hard ceiling
+  and inside the 40-50 MB realistic target window.
+- `ShadowRelocationFunctionalTest` ships with all four documented
+  assertions plus the size-ceiling pin.
+- End-to-end parse-gate test ships as
+  `ShadowParseGateFunctionalTest`. Loads the published shadow JAR
+  in a child-first (parent=null) `URLClassLoader`, reflectively
+  bootstraps `KotlinCoreEnvironment`, and parses a representative
+  fixture exercising every shape the original plan named.
+- Unit-test class ships as `KotlinLanguageParserTest`: 16 cases
+  covering package + class + class-less file → `<basename>Kt` +
+  basename-case preservation + empty-package fallback + wildcard
+  imports + nested + companion + anonymous-companion filter +
+  type-reference simple/dotted harvest with nullable + FQN inline
+  references + `@file:JvmName` flag + missing-file null + post-close
+  fail-closed + idempotent close.
+- `kotlinEnabled` flag wired through `AffectedTestsConfig.Builder`,
+  read from `-Daffected-tests.kotlin.enabled` via
+  `ProviderFactory.systemProperty(...)` for configuration-cache
+  safety. Flag value mixed into `ProjectIndexCache.configHash`.
+- `ProjectIndexCache.SCHEMA_VERSION` bumped 3 → 4 with a fresh
+  `prePr3SchemaSnapshotInvalidatesAndForcesFullRescan` test pinning
+  the rescan posture, plus `kotlinEnabledFlagFlipInvalidatesCache`
+  pinning the configHash branch.
+
+**Deferred to follow-ups (still in PR #3 scope on paper, scoped out
+in execution):**
+
+- Path-vs-package mismatch counter (`pathPackageMismatchCount`) and
+  the four pinned `--explain` lines. The parser already records
+  `@file:JvmName(...)` files via the `hasFileLevelJvmNameAnnotation(Path)`
+  side-channel; the engine wiring + `--explain` plumbing lands in a
+  follow-up.
+- Cucumber feature `10-issue-76-kotlin-ast.feature` covering each
+  AST-driven strategy (Naming, Usage, Implementation, Transitive)
+  with `.kt` fixtures plus the four pinned `--explain` strings.
+
+**Adopter-visible result:** No change unless they opt in.
+
+### PR #3 — original spec (kept for diff against shipped scope)
 **Scope:** Add the embeddable, the Kotlin parser, the shading rules,
 behind `affected-tests.kotlin.enabled` system property (default `false`).
 The dispatch infrastructure is already in place from PR #2 — registering

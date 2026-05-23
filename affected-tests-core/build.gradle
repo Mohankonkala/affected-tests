@@ -10,6 +10,20 @@ dependencies {
     implementation 'com.github.javaparser:javaparser-core:3.28.1'
     implementation 'org.slf4j:slf4j-api:2.0.18'
     testImplementation 'org.slf4j:slf4j-simple:2.0.18'
+
+    // Phase 2 (issue #76, PR #3) — Kotlin AST support via the
+    // shading-friendly embeddable flavour of the Kotlin compiler. The
+    // gradle module is the one that ships the shaded JAR (see
+    // affected-tests-gradle/build.gradle#shadowJar), so core consumes
+    // the embeddable as compileOnly: the symbols are needed at compile
+    // time for KotlinLanguageParser, but the runtime JAR comes from
+    // the published plugin's relocated classes. testImplementation is
+    // additive — KotlinLanguageParser unit tests in core need the
+    // embeddable on testRuntimeClasspath or every KotlinCoreEnvironment
+    // reference fails class-load with NoClassDefFoundError. See
+    // docs/PHASE-2-KOTLIN-AST.md §4 for the version-pin policy.
+    compileOnly 'org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.20'
+    testImplementation 'org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.20'
 }
 
 // Forward the specific affected-tests.* system properties that the

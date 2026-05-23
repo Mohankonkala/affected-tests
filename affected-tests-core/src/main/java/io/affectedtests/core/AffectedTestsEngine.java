@@ -419,7 +419,19 @@ public final class AffectedTestsEngine {
         ImplementationStrategy implStrategy = new ImplementationStrategy(config, namingStrategy, usageStrategy);
         TransitiveStrategy transitiveStrategy = new TransitiveStrategy(config, namingStrategy, usageStrategy);
 
-        ProjectIndex index = ProjectIndex.build(projectDir, config);
+        // try-with-resources on the {@link ProjectIndex}: when the
+        // Kotlin AST gate is on (issue #76 PR #3+), the index owns a
+        // {@code KotlinCoreEnvironment} parent {@link
+        // com.intellij.openapi.Disposable Disposable} that must be
+        // disposed at engine shutdown to avoid leaking ~25 MB of
+        // pinned MockApplication state on the Gradle-daemon
+        // classloader for the daemon's lifetime. With the gate off
+        // (default during the rollout window) the close is a no-op
+        // — the registry is Java-only and Java parsers are
+        // process-wide thread-locals — so wrapping unconditionally
+        // costs nothing but means a future flag flip does not
+        // require touching this site.
+        try (ProjectIndex index = ProjectIndex.build(projectDir, config)) {
 
         // Issue #42: build the list of (name, callable) work items the
         // engine will dispatch; running them serially below or via a
@@ -561,6 +573,7 @@ public final class AffectedTestsEngine {
                 survivingCrossPackage,
                 profile
         );
+        }
     }
 
     /**

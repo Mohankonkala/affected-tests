@@ -102,6 +102,37 @@ public class AffectedTestsPlugin implements Plugin<Project> {
                         .orElse(true)
         );
 
+        // Issue #76 PR #3 — Kotlin AST gate. Same shape as
+        // parallelDiscovery above, but the override is a system property
+        // (-Daffected-tests.kotlin.enabled=true) rather than a Gradle
+        // property (-PaffectedTests*) for two reasons:
+        //
+        //  1. The plan (docs/PHASE-2-KOTLIN-AST.md §9 PR #3) pinned
+        //     the system-property name as the rollout knob — adopters
+        //     who flip it on for a smoke test are expected to do so
+        //     via -D, matching how every other "experimental rollout"
+        //     toggle in the JVM ecosystem reads (Detekt, ktlint,
+        //     JavaParser language-level overrides).
+        //
+        //  2. ProviderFactory.systemProperty(...) is configuration-
+        //     cache compatible — the read happens at task execution
+        //     time (so config-cache replays do not staleness-snapshot
+        //     a build-start value) and Gradle records the property
+        //     read in the cache fingerprint so a flip across two runs
+        //     invalidates the cache automatically. The same is true
+        //     of gradleProperty() + the parallelDiscovery shape above;
+        //     swapping property kinds does not change the CC posture.
+        //
+        // Default OFF during the rollout window. PR #4 removes this
+        // block and flips the convention to {@code true}.
+        extension.getKotlinEnabled().convention(
+                project.getProviders().systemProperty("affected-tests.kotlin.enabled")
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .map(raw -> parseKotlinEnabledProperty(raw, pluginLog))
+                        .orElse(false)
+        );
+
         Project rootProject = project.getRootProject();
         Directory rootDir = rootProject.getLayout().getProjectDirectory();
 
@@ -124,6 +155,7 @@ public class AffectedTestsPlugin implements Plugin<Project> {
             task.getIncludeImplementationTests().set(extension.getIncludeImplementationTests());
             task.getImplementationNaming().set(extension.getImplementationNaming());
             task.getParallelDiscovery().set(extension.getParallelDiscovery());
+            task.getKotlinEnabled().set(extension.getKotlinEnabled());
             task.getMode().set(extension.getMode());
             task.getOnEmptyDiff().set(extension.getOnEmptyDiff());
             task.getOnAllFilesIgnored().set(extension.getOnAllFilesIgnored());
@@ -301,6 +333,37 @@ public class AffectedTestsPlugin implements Plugin<Project> {
                         + "expected one of true|false|1|0|on|off|yes|no. "
                         + "Falling back to the default (parallel discovery ON).", raw);
                 yield true;
+            }
+        };
+    }
+
+    /**
+     * Parses the {@code -Daffected-tests.kotlin.enabled} system property
+     * value. Mirrors {@link #parseParallelDiscoveryProperty(String, Logger)}'s
+     * accept-set + WARN-on-unknown shape so adopters do not have to
+     * remember a different vocabulary per knob. Issue #76 PR #3.
+     *
+     * <p>The default returned for unknown values is {@code false} —
+     * matching {@link
+     * io.affectedtests.core.config.AffectedTestsConfig.Builder}'s
+     * rollout-window default. Adopters who want Kotlin AST
+     * participation must say so unambiguously; a typo'd
+     * {@code -Daffected-tests.kotlin.enabled=tru} silently shipping
+     * Kotlin off is the safe failure mode while the embeddable
+     * shading + lifecycle posture is still being shaken out.
+     *
+     * <p>Package-private for unit-test reach.
+     */
+    static boolean parseKotlinEnabledProperty(String raw, Logger log) {
+        return switch (raw.toLowerCase(Locale.ROOT)) {
+            case "true", "1", "on", "yes" -> true;
+            case "false", "0", "off", "no" -> false;
+            default -> {
+                log.warn("Affected Tests: ignoring -Daffected-tests.kotlin.enabled='{}'; "
+                        + "expected one of true|false|1|0|on|off|yes|no. "
+                        + "Falling back to the default (Kotlin AST OFF — "
+                        + "issue #76 PR #3 rollout default).", raw);
+                yield false;
             }
         };
     }

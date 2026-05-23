@@ -1,65 +1,179 @@
 package io.affectedtests.core.discovery;
 
+import io.affectedtests.core.config.AffectedTestsConfig;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.nio.file.Path;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Registry of {@link LanguageParser} implementations, keyed by file
- * extension. Single source of truth for "which parser handles which
- * extension" — adding a new language is one entry here plus one
- * entry in {@link SourceExtensions#EXTENSIONS}.
+ * Per-engine registry of {@link LanguageParser} implementations,
+ * keyed by file extension. Single source of truth for "which parser
+ * handles which extension" in a given engine run — adding a new
+ * language is one entry in {@link #forConfig(AffectedTestsConfig)}
+ * plus one entry in {@link SourceExtensions#EXTENSIONS}.
  *
- * <p>Introduced in PR #2 of issue #76 (Phase 2 Kotlin AST). Today
- * the map only contains {@code .java} → {@link JavaLanguageParser}.
- * PR #3 of the rollout adds {@code .kt} →
- * {@code KotlinLanguageParser} (gated on
- * {@code -Daffected-tests.kotlin.enabled=true}); PR #4 flips the
- * flag default so Kotlin is registered unconditionally.
+ * <p>Pre-PR-3 of issue #76 this class was a static utility holding a
+ * {@code static final Map<String, LanguageParser>}. PR #3 converts
+ * to a per-engine instance because Kotlin's
+ * {@code KotlinCoreEnvironment} carries lifecycle state that must
+ * not be shared across engine runs (multi-MB MockApplication +
+ * extension-point registry; the IntelliJ platform is not designed
+ * for many MockApplications coexisting in the same JVM — see
+ * docs/PHASE-2-KOTLIN-AST.md §3.4). Each {@link ProjectIndex} owns
+ * a registry constructed from its
+ * {@link AffectedTestsConfig#kotlinEnabled()} flag and disposes it
+ * on engine shutdown.
  *
  * <p>Used by:
  *
  * <ul>
  *   <li>{@link ProjectIndex#compilationUnit(Path)} — dispatches by
- *       extension; non-Java extensions return {@code null} for the
- *       {@code CompilationUnit}-typed surface (Kotlin metadata
- *       comes from {@link LanguageParser#parseOrWarn} directly,
- *       not via {@code CompilationUnit}).</li>
+ *       extension via the per-instance registry; non-Java
+ *       extensions return {@code null} for the
+ *       {@link com.github.javaparser.ast.CompilationUnit}-typed
+ *       surface (Kotlin metadata flows through
+ *       {@link LanguageParser#parseOrWarn} directly, not via a
+ *       Java AST CompilationUnit).</li>
+ *   <li>{@link ProjectIndex#fileMetadata(Path)} — dispatches by
+ *       extension via the per-instance registry; non-Java parsers
+ *       bump {@code parseFailureCount} on null so malformed Kotlin
+ *       still escalates via {@code DISCOVERY_INCOMPLETE}.</li>
  *   <li>{@link UsageStrategy#metadataOrGet},
  *       {@link ImplementationStrategy#metadataOrGet},
  *       {@link TransitiveStrategy#metadataOrGet} — the no-index
- *       fallback path. Pre-PR-2 each of these called
- *       {@code JavaParsers.parseOrWarn(fallbackParser, file, label)}
- *       and ran the extractor inline, hard-coding Java even when
- *       the file was a {@code .kt} that PR #1 had widened the
- *       scanner to admit. Now they call
- *       {@link #parseOrWarn(Path, String)} which dispatches by
- *       extension.</li>
+ *       fallback path. Standalone strategy tests do not have an
+ *       engine-scoped registry available, so they route through
+ *       {@link #defaultJavaOnly()}, which is the safe-no-Kotlin
+ *       posture (Kotlin participation requires the engine to bring
+ *       up + dispose a {@link KotlinLanguageParser} lifecycle, and
+ *       a unit test driving a strategy directly must not be
+ *       responsible for that).</li>
  * </ul>
  *
- * <p>Visibility is package-private. Strategies + {@link
- * ProjectIndex} live in this package; outside callers should
+ * <p>Visibility is package-private. Strategies, {@link ProjectIndex},
+ * and the engine live in this package; outside callers should
  * consume {@link FileMetadata} via the strategy's public
  * {@code discoverTests} surface, not by reaching into the registry.
  */
-final class LanguageParsers {
+final class LanguageParsers implements AutoCloseable {
+
+    private static final Logger log = LoggerFactory.getLogger(LanguageParsers.class);
 
     /**
-     * Extension → parser map. Kept as a static-final so a typo at
-     * registration time fails class-load, not at the first
-     * adopter's first parse. Order is not significant; lookup is
-     * keyed by lowercased extension (with leading dot).
+     * Singleton registry containing only {@link JavaLanguageParser}.
+     * Lifecycle-free (Java's parsers are thread-locals shared across
+     * every engine run for the JVM's life) and shared across every
+     * caller that does not need a per-engine instance:
      *
-     * <p>{@code .kts} (Kotlin script) and {@code .gradle.kts}
-     * (Gradle Kotlin DSL) are absent from this map on purpose.
-     * They look up to {@code null} and route to
-     * {@code unmappedChangedFiles}; Phase 1's polyglot hint
-     * surfaces them separately.
+     * <ul>
+     *   <li>Strategy fallback path ({@code metadataOrGet} when the
+     *       supplied {@code ProjectIndex} is {@code null}, the
+     *       standalone-test posture).</li>
+     *   <li>Tests that probe the registry directly without spinning
+     *       up a {@link ProjectIndex}.</li>
+     * </ul>
+     *
+     * <p>Held as a {@code static final} instance so concurrent
+     * unit-test callers do not race to construct redundant
+     * registries. {@link #close()} is a no-op for this instance:
+     * the singleton outlives every test and every engine run, so
+     * disposing it would brick subsequent callers.
      */
-    private static final Map<String, LanguageParser> BY_EXTENSION =
-            Map.of(JavaLanguageParser.INSTANCE.extension(), JavaLanguageParser.INSTANCE);
+    private static final LanguageParsers DEFAULT_JAVA_ONLY =
+            new LanguageParsers(Map.of(JavaLanguageParser.INSTANCE.extension(),
+                    JavaLanguageParser.INSTANCE),
+                    /* lifecycleOwned */ false);
 
-    private LanguageParsers() {
-        // utility class
+    /**
+     * Map of registered parsers, keyed by lowercased extension
+     * (with leading dot — see {@link LanguageParser#extension()}).
+     * Insertion-ordered for deterministic iteration during
+     * {@link #close()} so any post-mortem log of disposal is stable
+     * across runs. Defensively copied at construction.
+     */
+    private final Map<String, LanguageParser> byExtension;
+
+    /**
+     * Whether {@link #close()} should walk the registered parsers
+     * and dispose them. {@code false} for {@link #DEFAULT_JAVA_ONLY}
+     * (the singleton must not be torn down) and any other shared
+     * registry; {@code true} for instances built from a
+     * per-engine config via {@link #forConfig(AffectedTestsConfig)}
+     * — those instances own the parsers' resources and are
+     * responsible for releasing them on engine shutdown.
+     */
+    private final boolean lifecycleOwned;
+
+    private LanguageParsers(Map<String, LanguageParser> byExtension, boolean lifecycleOwned) {
+        // Defensive copy + insertion order. {@link Map#copyOf}
+        // produces an {@code ImmutableCollections.MapN} with
+        // hash-based iteration for 2+ entries — wrapping a
+        // {@link LinkedHashMap} in {@code Map.copyOf} would defeat
+        // the order property we want to preserve. Use
+        // {@link Collections#unmodifiableMap} on a defensive
+        // {@link LinkedHashMap} copy to actually keep the
+        // registration order so the disposal log is stable across
+        // runs.
+        this.byExtension =
+                Collections.unmodifiableMap(new LinkedHashMap<>(byExtension));
+        this.lifecycleOwned = lifecycleOwned;
+    }
+
+    /**
+     * Returns the shared Java-only registry. Used by the strategy
+     * fallback path when no per-engine registry is available — the
+     * standalone-test posture where strategies are exercised
+     * without an engine-supplied {@link ProjectIndex}.
+     *
+     * <p>The singleton is lifecycle-free so callers do not need to
+     * close it; in fact closing it is a no-op so a misconfigured
+     * test that calls {@code defaultJavaOnly().close()} does not
+     * brick subsequent tests.
+     */
+    static LanguageParsers defaultJavaOnly() {
+        return DEFAULT_JAVA_ONLY;
+    }
+
+    /**
+     * Builds a fresh registry shaped by {@code config}. Always
+     * registers {@link JavaLanguageParser}; additionally registers
+     * {@code KotlinLanguageParser} when
+     * {@link AffectedTestsConfig#kotlinEnabled()} is {@code true}.
+     *
+     * <p>The returned instance owns the lifecycle of any
+     * Kotlin-specific resources it constructs, so callers must close
+     * it (typically via try-with-resources on the
+     * {@link ProjectIndex} that wraps it) once discovery is done.
+     *
+     * <p>If {@code config.kotlinEnabled()} is false, the returned
+     * instance is a thin wrapper around the same single-parser map
+     * the {@link #defaultJavaOnly()} singleton uses, but with its
+     * own {@code lifecycleOwned} flag set to {@code true}.
+     * {@code close()} on a Java-only instance is still a no-op (the
+     * static {@link JavaLanguageParser#INSTANCE} is process-wide),
+     * but keeping the flag {@code true} means a Kotlin parser added
+     * later via a different code path does get disposed — defence
+     * in depth against a future refactor that loosens the contract.
+     */
+    static LanguageParsers forConfig(AffectedTestsConfig config) {
+        LinkedHashMap<String, LanguageParser> parsers = new LinkedHashMap<>();
+        parsers.put(JavaLanguageParser.INSTANCE.extension(), JavaLanguageParser.INSTANCE);
+        if (config.kotlinEnabled()) {
+            // Construction is cheap — KotlinCoreEnvironment is built
+            // lazily on the first .kt parse, not at registry build
+            // time. The registry just holds the wrapper object; the
+            // multi-MB embeddable bootstrap is paid only if the
+            // engine actually parses a .kt file. See
+            // docs/PHASE-2-KOTLIN-AST.md §3.4 for the lifecycle
+            // protocol the parser implements.
+            KotlinLanguageParser kotlin = new KotlinLanguageParser();
+            parsers.put(kotlin.extension(), kotlin);
+        }
+        return new LanguageParsers(parsers, /* lifecycleOwned */ true);
     }
 
     /**
@@ -67,13 +181,15 @@ final class LanguageParsers {
      *         extension, or {@code null} if no parser is
      *         registered. {@code null} is the canonical signal for
      *         "this extension has no parser available in the
-     *         current rollout phase" (e.g. {@code .kt} pre-PR-3,
-     *         or always for {@code .kts} / {@code .groovy} /
+     *         current rollout phase" (e.g. {@code .kt} when
+     *         {@code -Daffected-tests.kotlin.enabled} is false, or
+     *         always for {@code .kts} / {@code .groovy} /
      *         {@code .scala}). Callers translate {@code null} into
      *         "skip this file" — the same posture
-     *         {@code parseOrWarn} returning {@code null} carries.
+     *         {@link LanguageParser#parseOrWarn} returning
+     *         {@code null} carries.
      */
-    static LanguageParser forFile(Path file) {
+    LanguageParser forFile(Path file) {
         if (file == null) return null;
         // Single source of truth for the path → extension contract.
         // {@link SourceExtensions#extensionOf} already enforces:
@@ -101,9 +217,9 @@ final class LanguageParsers {
      *            callers that take input from the filesystem must
      *            lowercase first.
      */
-    static LanguageParser forExtension(String ext) {
+    LanguageParser forExtension(String ext) {
         if (ext == null) return null;
-        return BY_EXTENSION.get(ext);
+        return byExtension.get(ext);
     }
 
     /**
@@ -126,9 +242,43 @@ final class LanguageParsers {
      * into a single dispatch call that's correct regardless of
      * which language the file is in.
      */
-    static FileMetadata parseOrWarn(Path file, String label) {
+    FileMetadata parseOrWarn(Path file, String label) {
         LanguageParser parser = forFile(file);
         if (parser == null) return null;
         return parser.parseOrWarn(file, label);
+    }
+
+    /**
+     * Disposes every registered parser if this instance owns their
+     * lifecycle. No-op when called on the {@link #defaultJavaOnly()}
+     * singleton: the singleton is process-wide and disposing it
+     * would brick every subsequent fallback-path caller. Safe to
+     * call more than once — {@link LanguageParser#close()} is
+     * required to be idempotent.
+     *
+     * <p>Per-parser disposal failures are swallowed into a
+     * {@code DEBUG} log line and disposal continues with the next
+     * parser. The engine must not abort shutdown because one
+     * parser failed to release its resources; the bounded leak of
+     * a failed Kotlin disposal (one MockApplication per Gradle
+     * daemon) is preferable to a half-shut-down engine that leaves
+     * file locks held.
+     */
+    @Override
+    public void close() {
+        if (!lifecycleOwned) return;
+        for (LanguageParser parser : byExtension.values()) {
+            try {
+                parser.close();
+            } catch (Exception e) {
+                // Swallow — see Javadoc above for the bounded-leak
+                // tradeoff. Sanitisation is unnecessary because the
+                // exception message comes from the parser
+                // implementation (internal text), not from
+                // attacker-committable file contents.
+                log.debug("Affected Tests: language parser '{}' failed to close: {}",
+                        parser.extension(), e.getMessage());
+            }
+        }
     }
 }
