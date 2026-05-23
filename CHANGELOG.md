@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Kotlin path-derived mapping (issue #76 / #47, PR #1 of Phase 2)
+
+Kotlin (`.kt`) sources are now first-class participants in the
+`affected-tests` discovery pipeline at the path-derived mapping
+tier. Pre-PR-1 every `.kt` file in a diff fell through to the
+`UNMAPPED_FILE` bucket, escalating to `FULL_SUITE` under the CI
+default — the most common adopter complaint behind issue #47.
+PR #1 widens five suffix-strip / extension-filter sites
+(`SourceFileScanner.collectJavaFiles` inner walker,
+`SourceFileScanner.walkFqnsUnder`, `SourceFileScanner.pathToFqn`,
+`PathToClassMapper.mapChangedFiles` and `tryMapToClass`,
+`UsageStrategy.extractFqn`) into the new
+`io.affectedtests.core.discovery.SourceExtensions` helper so a
+single point of truth governs the supported source-language set.
+
+For adopters with mixed Java + Kotlin codebases:
+
+- A `Foo.kt` with a sibling `FooTest.kt` now selects via
+  `NamingConventionStrategy` exactly like its Java counterpart —
+  no FULL_SUITE escalation on every Kotlin edit.
+- Top-level Kotlin functions (`Util.kt` with no class declaration)
+  emit a synthetic `<basename>Kt` FQN alongside the path-derived
+  one, so a `UtilKtTest.kt` neighbour selects via
+  `NamingConventionStrategy` (which appends `Test` / `IT` /
+  `IntegrationTest` suffixes to changed production FQNs and
+  probes against the test-FQN universe). PR #3 of the rollout
+  will additionally light up `UsageStrategy` tier-1 import lookup
+  so a Java test that imports the compiled `UtilKt` class also
+  selects without a name-suffix neighbour. Test-side synthetic
+  emission is deliberately suppressed to avoid "no tests found"
+  runner errors.
+- `--explain` adds two pinned hints: `Kotlin source mapped via
+  filename only; AST-driven strategies skipped (issue #76).` and
+  `Kotlin source unmapped (no matching source/test root); routed
+  to unmapped bucket.` so adopters can grep CI logs for the
+  rollout signal.
+- Bucket labels in `--explain` drop the `.java` qualifier
+  (`production` / `test` instead of `production .java` /
+  `test .java`) so `.kt` rows don't need a parallel listing.
+
+PR #1 ships path-derived mapping only — `FileMetadata` is not
+populated for Kotlin yet, so `UsageStrategy` / `ImplementationStrategy`
+/ `TransitiveStrategy` AST-driven tiers return zero matches for
+`.kt` until PR #3 lands `kotlin-compiler-embeddable`. PR #4 makes
+the full AST path default and demotes the PR #1 hints. See
+`docs/PHASE-2-KOTLIN-AST.md` §2-§4 for the full rollout sequence.
+
+`ProjectIndexCache.SCHEMA_VERSION` bumps from 2 → 3 to invalidate
+pre-PR-1 caches on mixed Java + Kotlin projects — the `configHash`
+hashes only the declared dir-list strings, not the file-extension
+scope the scanner walks, so a warm cache from a v2.x build would
+otherwise silently serve a Java-only test-FQN universe to the new
+mapper.
+
 ### Added — Phase 2 Kotlin AST tech plan (issue #76 / #47)
 
 `docs/PHASE-2-KOTLIN-AST.md` lays out the plan for making Kotlin a

@@ -1429,8 +1429,14 @@ public abstract class AffectedTestTask extends DefaultTask {
         lines.add("Buckets:");
         lines.add("  ignored         " + buckets.ignoredFiles().size());
         lines.add("  out-of-scope    " + buckets.outOfScopeFiles().size());
-        lines.add("  production .java " + buckets.productionFiles().size());
-        lines.add("  test .java      " + buckets.testFiles().size());
+        // Pre-PR-1 of issue #76 these read "production .java" /
+        // "test .java" because only Java was mapped. PR #1 widens
+        // the scope to .java + .kt; the labels drop the extension
+        // qualifier rather than enumerate both, so PR #3 (full
+        // Kotlin AST) and any future Groovy / Scala extension
+        // doesn't have to re-touch this format.
+        lines.add("  production      " + buckets.productionFiles().size());
+        lines.add("  test            " + buckets.testFiles().size());
         lines.add("  unmapped        " + buckets.unmappedFiles().size());
 
         appendSample(lines, "ignored",      buckets.ignoredFiles());
@@ -1477,6 +1483,15 @@ public abstract class AffectedTestTask extends DefaultTask {
         // targeted branches — see {@link #appendSituationHint} for the
         // full routing.
         appendSituationHint(lines, config, result);
+
+        // Phase 2 PR #1 of issue #76: Kotlin sources now map via
+        // path-derived FQN (filename only — no AST). Surface a
+        // pinned hint whenever the diff contained a .kt file so
+        // adopters can grep their CI logs for the rollout signal.
+        // Independent of {@link #appendSituationHint} because it
+        // fires on every situation that mapped Kotlin, not only
+        // the mapper-touching ones.
+        appendKotlinMappingHints(lines, result);
 
         // Per-module dispatch preview — populated only for
         // SELECTED runs so the "what tasks will Gradle actually
@@ -1782,8 +1797,14 @@ public abstract class AffectedTestTask extends DefaultTask {
         // ordering follows decreasing real-world frequency (Kotlin
         // first — Spring Boot + Kotlin is by far the most common
         // mixed-source shape we'll see this hint fire on).
+        // Pre-PR-1 of issue #76 this map included `.kt` → Kotlin.
+        // PR #1 moved Kotlin out of the polyglot hint entirely (see
+        // {@link #polyglotExtensionOf} for why), so it is omitted
+        // here too. `.kts` (Kotlin script) remains Java-only mapped
+        // and still maps to "Kotlin" — adopters who edit a `.kts`
+        // build script unrelated to a `.gradle.kts` file see the
+        // hint and recognise their language.
         java.util.Map<String, String> displayNames = new java.util.LinkedHashMap<>();
-        displayNames.put(".kt",     "Kotlin");
         displayNames.put(".kts",    "Kotlin");
         displayNames.put(".groovy", "Groovy");
         displayNames.put(".gvy",    "Groovy");
@@ -1810,6 +1831,71 @@ public abstract class AffectedTestTask extends DefaultTask {
     }
 
     /**
+     * Phase 2 PR #1 of issue #76: emits one of two pinned
+     * {@code --explain} lines based on which buckets contain
+     * {@code .kt} files. Stable across plugin versions so adopters
+     * can grep their CI logs for the rollout signal.
+     *
+     * <ul>
+     *   <li>{@code Kotlin source mapped via filename only;
+     *       AST-driven strategies skipped (issue #76).} fires when
+     *       any {@code .kt} file landed in
+     *       {@link io.affectedtests.core.AffectedTestsResult.Buckets#productionFiles()}
+     *       or
+     *       {@link io.affectedtests.core.AffectedTestsResult.Buckets#testFiles()}.
+     *       Tells adopters that the file was selected via path-
+     *       derived FQN (NamingConventionStrategy + UsageStrategy
+     *       tier 1 import lookup against the synthetic
+     *       {@code <basename>Kt} class), not via AST. PR #3 lights
+     *       up the AST path; PR #4 makes it default.</li>
+     *   <li>{@code Kotlin source unmapped (no matching source/test
+     *       root); routed to unmapped bucket.} fires when any
+     *       {@code .kt} file landed in
+     *       {@link io.affectedtests.core.AffectedTestsResult.Buckets#unmappedFiles()}.
+     *       Distinct from the older polyglot hint
+     *       ({@link #appendUnmappedFileHint}) which still fires for
+     *       Groovy / Scala / {@code .kts} — those remain Java-only
+     *       mapped pending separate follow-ups. Pre-PR-1 the polyglot
+     *       hint was the catch-all for {@code .kt} too; the new
+     *       string narrows the diagnosis: a {@code .kt} in unmapped
+     *       post-PR-1 means the file path didn't match any
+     *       configured source / test root, not that the plugin
+     *       can't map Kotlin extensions.</li>
+     * </ul>
+     */
+    static void appendKotlinMappingHints(List<String> lines,
+                                         AffectedTestsResult result) {
+        Buckets buckets = result.buckets();
+        boolean kotlinMapped = anyKotlin(buckets.productionFiles())
+                || anyKotlin(buckets.testFiles());
+        boolean kotlinUnmapped = anyKotlin(buckets.unmappedFiles());
+
+        if (kotlinMapped) {
+            lines.add("Hint:            Kotlin source mapped via filename only;"
+                    + " AST-driven strategies skipped (issue #76).");
+        }
+        if (kotlinUnmapped) {
+            lines.add("Hint:            Kotlin source unmapped"
+                    + " (no matching source/test root); routed to unmapped bucket.");
+        }
+    }
+
+    private static boolean anyKotlin(java.util.Collection<String> paths) {
+        if (paths == null || paths.isEmpty()) return false;
+        for (String path : paths) {
+            // No `!endsWith(".gradle.kts")` carve-out needed here:
+            // `.gradle.kts` ends in `.kts` (not `.kt`), so it can
+            // never reach this branch. The `.kts` carve-out lives
+            // in {@link #polyglotExtensionOf} where it is actually
+            // load-bearing.
+            if (path.toLowerCase(Locale.ROOT).endsWith(".kt")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Returns the lowercased polyglot extension (e.g. {@code .kt})
      * for paths whose extension matches a known JVM-language file
      * shape, or {@code null} for everything else (including
@@ -1829,7 +1915,19 @@ public abstract class AffectedTestTask extends DefaultTask {
     private static String polyglotExtensionOf(String path) {
         String lower = path.toLowerCase(Locale.ROOT);
         if (lower.endsWith(".gradle.kts")) return null;
-        if (lower.endsWith(".kt"))     return ".kt";
+        // `.kt` was deliberately dropped in PR #1 of issue #76:
+        // post-PR-1 the plugin maps Kotlin sources via
+        // path-derived FQN (PathToClassMapper), so a `.kt` in the
+        // unmapped bucket means the file sits outside any
+        // configured source / test root — not that the plugin
+        // can't see Kotlin extensions. The phase 1 hint's text
+        // ("the plugin currently maps only .java") would be
+        // factually wrong for `.kt`, and would contradict the new
+        // `Kotlin source unmapped (no matching source/test root)`
+        // hint emitted by {@link #appendKotlinMappingHints}.
+        // `.kts`, `.groovy`, `.gvy`, `.scala`, `.sc` remain
+        // Java-only mapped; they keep the original phase-1 hint
+        // text and the link to issue #47.
         if (lower.endsWith(".kts"))    return ".kts";
         if (lower.endsWith(".groovy")) return ".groovy";
         if (lower.endsWith(".gvy"))    return ".gvy";

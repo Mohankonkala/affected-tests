@@ -43,8 +43,8 @@ Changed files:   3
 Buckets:
   ignored         1
   out-of-scope    0
-  production .java 1
-  test .java      0
+  production      1
+  test            0
   unmapped        1
   ignored sample: README.md
   production sample: src/main/java/com/example/Foo.java
@@ -369,8 +369,9 @@ The pipeline is five stages: **detect** what changed, **bucket** each path (igno
 
 ### Known limitations
 
-- **Java-only mapping.** The plugin only recognises `.java` source files. Any `.kt`, `.kts`, `.groovy`, or `.scala` change in the diff falls through to the `unmapped` bucket and — under the default `ci` / `strict` profiles — escalates to `FULL_SUITE` via `UNMAPPED_FILE`. Polyglot Spring Boot + Kotlin shapes therefore see zero selection win until per-language support lands. Tracking issue: [#47](https://github.com/vedanthvdev/affected-tests/issues/47); Phase 2 tech plan for Kotlin AST support: [`docs/PHASE-2-KOTLIN-AST.md`](docs/PHASE-2-KOTLIN-AST.md) (issue [#76](https://github.com/vedanthvdev/affected-tests/issues/76)).
-  - Workaround for "Java production + Kotlin tests" repos that want partial value: route the Kotlin test files into `outOfScopeTestDirs` so a Kotlin-only edit lands in `ALL_FILES_OUT_OF_SCOPE` (`SKIPPED`) instead of escalating; combine with a separate Gradle task that runs the Kotlin tests unconditionally on every MR.
+- **Kotlin: path-derived mapping only (no AST yet).** As of PR #1 of issue [#76](https://github.com/vedanthvdev/affected-tests/issues/76), `.kt` sources participate in the same path-derived mapping pipeline as `.java`: a `Foo.kt` with a sibling `FooTest.kt` selects via the naming-convention strategy, top-level functions in `Util.kt` emit a synthetic `UtilKt` FQN, and `--explain` surfaces a `Kotlin source mapped via filename only` hint. The AST-driven tiers (UsageStrategy direct-import, ImplementationStrategy supertype walk, TransitiveStrategy reference graph) still return zero matches for Kotlin until PR #3 of the rollout lands `kotlin-compiler-embeddable`; net effect for adopters is "naming-strategy parity today, full parity with Java when Phase 2 completes". See [`docs/PHASE-2-KOTLIN-AST.md`](docs/PHASE-2-KOTLIN-AST.md) for the four-PR sequence.
+- **Other JVM polyglot files still unmapped.** `.kts`, `.groovy`, and `.scala` changes still fall through to the `unmapped` bucket and — under the default `ci` / `strict` profiles — escalate to `FULL_SUITE` via `UNMAPPED_FILE`. Tracking issue: [#47](https://github.com/vedanthvdev/affected-tests/issues/47).
+  - Workaround for "Java production + Groovy/Scala tests" repos: route those test files into `outOfScopeTestDirs` so a non-Java/Kotlin-only edit lands in `ALL_FILES_OUT_OF_SCOPE` (`SKIPPED`) instead of escalating; combine with a separate Gradle task that runs those tests unconditionally on every MR.
 - **Gradle 9.3+ only.** The published plugin is built against the current Gradle wrapper (currently 9.5.1) and requires Java 21+ on the classpath. Older Gradle versions are not supported.
 - **In-process git read.** Diff resolution uses JGit reading the working-tree `.git` directory directly. Bare repos, alternate worktrees that don't have their own `.git/objects`, and shallow clones with the base ref outside the fetched history are not supported — the engine logs a JGit error and escalates to `FULL_SUITE`.
 

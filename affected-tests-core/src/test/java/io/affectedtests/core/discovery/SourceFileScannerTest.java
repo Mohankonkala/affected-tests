@@ -246,4 +246,119 @@ class SourceFileScannerTest {
         assertTrue(fqns.contains("com.example.BarTest"));
         assertEquals(2, fqns.size());
     }
+
+    // ── Phase 2 PR #1 of issue #76 — Kotlin sources participate in
+    //    every walker / FQN helper that previously hard-coded .java.
+    //    Each test below pins one of the five suffix-strip /
+    //    extension-filter sites listed in docs/PHASE-2-KOTLIN-AST.md
+    //    §2 so a regression to Java-only behaviour is caught at
+    //    unit-test latency, not after a Kotlin adopter files an issue.
+
+    @Test
+    void collectsKotlinFilesAlongsideJava() throws IOException {
+        Path pkg = tempDir.resolve("src/main/java/com/example");
+        Files.createDirectories(pkg);
+        Files.writeString(pkg.resolve("Foo.java"), "package com.example; class Foo {}");
+        Files.writeString(pkg.resolve("Bar.kt"), "package com.example\nclass Bar");
+
+        List<Path> files = SourceFileScanner.collectJavaFiles(
+                tempDir.resolve("src/main/java"));
+
+        assertEquals(2, files.size(), "Both .java and .kt must be collected; got " + files);
+        assertTrue(files.stream().anyMatch(p -> p.getFileName().toString().equals("Foo.java")));
+        assertTrue(files.stream().anyMatch(p -> p.getFileName().toString().equals("Bar.kt")));
+    }
+
+    @Test
+    void scanTestFqnsIncludesKotlinTestClasses() throws IOException {
+        Path pkg = tempDir.resolve("src/test/java/com/example");
+        Files.createDirectories(pkg);
+        Files.writeString(pkg.resolve("FooTest.java"),
+                "package com.example; class FooTest {}");
+        Files.writeString(pkg.resolve("BarTest.kt"),
+                "package com.example\nclass BarTest");
+
+        var fqns = SourceFileScanner.scanTestFqns(tempDir, List.of("src/test/java"));
+
+        assertTrue(fqns.contains("com.example.FooTest"));
+        assertTrue(fqns.contains("com.example.BarTest"),
+                "Kotlin test FQN must appear in the test-FQN universe — "
+                        + "NamingConventionStrategy reads from this set, and PR #1's "
+                        + "selection guarantee for Kotlin tests rests on widening this "
+                        + "scanner. Got: " + fqns);
+        assertEquals(2, fqns.size());
+    }
+
+    @Test
+    void fqnsUnderHandlesKotlinTopLevelFunctionFile() throws IOException {
+        Path src = tempDir.resolve("src/main/java");
+        Path pkg = src.resolve("com/example");
+        Files.createDirectories(pkg);
+        // Top-level Kotlin file with no class declaration. The
+        // path-derived FQN is `com.example.Util` (the file's
+        // basename); the synthetic `<basename>Kt` shape is emitted
+        // on the diff side by PathToClassMapper, not by fqnsUnder
+        // (which is a test-FQN feeder for naming-strategy lookups).
+        Files.writeString(pkg.resolve("Util.kt"),
+                "package com.example\nfun greet() = \"hi\"");
+
+        var fqns = SourceFileScanner.fqnsUnder(src);
+
+        assertTrue(fqns.contains("com.example.Util"),
+                "Path-derived FQN must strip the .kt suffix; got " + fqns);
+        assertEquals(1, fqns.size(),
+                "fqnsUnder is the test-FQN universe — it must NOT emit "
+                        + "the synthetic <basename>Kt here (that's a diff-side "
+                        + "concern handled in PathToClassMapper). Got: " + fqns);
+    }
+
+    @Test
+    void pathToFqnStripsKotlinSuffix() {
+        String fqn = SourceFileScanner.pathToFqn(
+                Path.of("/repo/api/src/main/java/com/example/Foo.kt"),
+                List.of("src/main/java"));
+
+        assertEquals("com.example.Foo", fqn,
+                "pathToFqn must strip both .java and .kt suffixes — pre-PR-1 "
+                        + "the .kt suffix slipped through the dotted-segment "
+                        + "transform and silently poisoned every downstream strategy "
+                        + "that treated FQNs ending in `.kt` as class names.");
+    }
+
+    @Test
+    void pathToFqnStripsJavaSuffix() {
+        // Companion to pathToFqnStripsKotlinSuffix — the centralised
+        // strip helper must keep the pre-PR-1 .java behaviour intact.
+        String fqn = SourceFileScanner.pathToFqn(
+                Path.of("/repo/api/src/main/java/com/example/Foo.java"),
+                List.of("src/main/java"));
+
+        assertEquals("com.example.Foo", fqn);
+    }
+
+    @Test
+    void fqnsUnderDeduplicatesSameBasenameAcrossJavaAndKotlin() throws IOException {
+        // Migration shape: `Foo.java` and `Foo.kt` co-exist in the
+        // same package. Both produce the same path-derived FQN
+        // `com.example.Foo` after suffix-strip. `walkFqnsUnder` uses
+        // `putIfAbsent` so the FQN appears exactly once — which file
+        // "wins" the path mapping is filesystem-walk-order-dependent
+        // and intentionally unspecified, but the FQN universe must
+        // stay stable in size. Without this test, a refactor that
+        // accidentally switched to `put` would double-count files
+        // and confuse downstream consumers that index by FQN.
+        Path src = tempDir.resolve("src/main/java");
+        Path pkg = src.resolve("com/example");
+        Files.createDirectories(pkg);
+        Files.writeString(pkg.resolve("Foo.java"),
+                "package com.example; class Foo {}");
+        Files.writeString(pkg.resolve("Foo.kt"),
+                "package com.example\nclass Foo");
+
+        var fqns = SourceFileScanner.fqnsUnder(src);
+
+        assertEquals(1, fqns.size(),
+                "Same-basename Java + Kotlin must dedupe to one FQN; got " + fqns);
+        assertTrue(fqns.contains("com.example.Foo"));
+    }
 }

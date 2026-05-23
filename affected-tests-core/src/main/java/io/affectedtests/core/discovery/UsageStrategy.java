@@ -294,9 +294,7 @@ public final class UsageStrategy implements TestDiscoveryStrategy {
                 String fqn = relative.toString()
                         .replace(java.io.File.separatorChar, '.')
                         .replace('/', '.');
-                if (fqn.endsWith(".java")) {
-                    fqn = fqn.substring(0, fqn.length() - 5);
-                }
+                fqn = SourceExtensions.stripKnownExtension(fqn);
                 return fqn;
             }
         }

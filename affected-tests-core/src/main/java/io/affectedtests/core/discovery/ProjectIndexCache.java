@@ -41,13 +41,16 @@ import java.util.Set;
  *
  * <p>Stage 1 caches four path-derived index aggregates:
  * <ul>
- *   <li>{@code sourceFiles} — absolute paths of every {@code .java} file under {@code sourceDirs}</li>
- *   <li>{@code testFiles} — absolute paths of every {@code .java} file under {@code testDirs}</li>
+ *   <li>{@code sourceFiles} — absolute paths of every source file
+ *       (extensions in {@link SourceExtensions#EXTENSIONS}) under
+ *       {@code sourceDirs}</li>
+ *   <li>{@code testFiles} — absolute paths of every source file
+ *       under {@code testDirs}</li>
  *   <li>{@code testFqnToPath} — ordered map of test FQN to its file</li>
  *   <li>{@code sourceFqns} — set of production FQNs</li>
  * </ul>
  *
- * <p>Stage 2 ({@code SCHEMA_VERSION = 2}) caches per-file
+ * <p>Stage 2 ({@code SCHEMA_VERSION = 2}, since 2024-Q4) cached per-file
  * AST-derived data — declared package, primary type, imports, type-ref
  * simple/dotted names, and per-decl supertype names — captured as
  * {@link FileMetadata} records so {@link UsageStrategy},
@@ -108,8 +111,26 @@ public final class ProjectIndexCache {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectIndexCache.class);
 
-    /** Version of the on-disk format. Bumped when any line shape changes incompatibly. */
-    static final int SCHEMA_VERSION = 2;
+    /**
+     * Version of the on-disk format. Bumped when any line shape — or
+     * any pre-cache scan-result shape — changes incompatibly.
+     *
+     * <p>{@code v3} (PR #1 of issue #76, Phase 2 Kotlin AST):
+     * {@link SourceFileScanner} now collects {@code .kt} files
+     * alongside {@code .java} under every configured source / test
+     * dir. The on-disk row format does not change, but
+     * {@link #configHash(io.affectedtests.core.config.AffectedTestsConfig)}
+     * hashes only the declared dir-list strings — not the
+     * file-extension scope the scanner applies inside those dirs —
+     * so a pre-PR-1 cache from a mixed Java + Kotlin project is
+     * functionally stale: its {@code testFqnToPath} universe is
+     * missing every Kotlin test FQN. Bumping the schema is the only
+     * mechanism that guarantees a clean rescan on warm caches across
+     * the upgrade boundary. PR #3 (full Kotlin AST persistence)
+     * bumps to {@code v4} when the row format itself changes.
+     * See {@code docs/PHASE-2-KOTLIN-AST.md} §7.
+     */
+    static final int SCHEMA_VERSION = 3;
 
     private static final String CACHE_DIR_REL = "build/affected-tests/index/v1";
     private static final String SNAPSHOT_FILE = "snapshot.tsv";

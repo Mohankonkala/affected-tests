@@ -37,13 +37,25 @@ public final class SourceFileScanner {
         // utility class
     }
 
-    // ── Java file collection ────────────────────────────────────────────
+    // ── Source file collection (Java + Kotlin) ──────────────────────────
 
     /**
-     * Recursively collects all {@code .java} files under {@code dir}.
+     * Recursively collects all source files (extensions in
+     * {@link SourceExtensions#EXTENSIONS}) under {@code dir}.
+     *
+     * <p>Pre-PR-1 of issue #76 this method only collected {@code .java}
+     * files (hence the historical name); the public name is preserved
+     * for backwards compatibility with downstream callers but the
+     * inner walker now picks up {@code .kt} too. A rename to
+     * {@code collectSourceFilesUnder} is deferred — no follow-up
+     * issue tracks it yet, and the cost of renaming is uniform whether
+     * it lands now or with PR #4 of the rollout (~6 internal call
+     * sites in this repo). The Javadoc here is the only signal a
+     * future maintainer has, so the "lying name" is documented
+     * up-front rather than disguised.
      *
      * @param dir root directory to walk
-     * @return list of paths to {@code .java} files
+     * @return list of paths to {@code .java} / {@code .kt} files
      */
     public static List<Path> collectJavaFiles(Path dir) {
         List<Path> files = new ArrayList<>();
@@ -52,8 +64,9 @@ public final class SourceFileScanner {
     }
 
     /**
-     * Recursively collects all {@code .java} files under {@code dir},
-     * appending them to the provided list.
+     * Recursively collects all source files under {@code dir} (extensions
+     * in {@link SourceExtensions#EXTENSIONS}), appending them to the
+     * provided list.
      *
      * <p>Symlinks, at either the directory or file level, are never
      * followed or added to the result. The directory-level
@@ -94,7 +107,7 @@ public final class SourceFileScanner {
                     if (attrs.isSymbolicLink()) {
                         return FileVisitResult.CONTINUE;
                     }
-                    if (file.toString().endsWith(".java")) {
+                    if (SourceExtensions.isSource(file.toString())) {
                         result.add(file);
                     }
                     return FileVisitResult.CONTINUE;
@@ -110,7 +123,7 @@ public final class SourceFileScanner {
                 }
             });
         } catch (IOException e) {
-            log.warn("Affected Tests: error collecting Java files from {}: {}",
+            log.warn("Affected Tests: error collecting source files from {}: {}",
                     LogSanitizer.sanitize(String.valueOf(dir)),
                     LogSanitizer.sanitize(e.getMessage()));
         }
@@ -191,7 +204,7 @@ public final class SourceFileScanner {
 
     /**
      * Scans all configured test directories and returns the FQNs of every
-     * {@code .java} file found.
+     * source file found (extensions in {@link SourceExtensions#EXTENSIONS}).
      */
     public static Set<String> scanTestFqns(Path projectDir, List<String> testDirs) {
         return scanTestFqnsWithFiles(projectDir, testDirs).keySet();
@@ -218,7 +231,9 @@ public final class SourceFileScanner {
     // ── FQN helpers ─────────────────────────────────────────────────────
 
     /**
-     * Converts {@code .java} files under a source-root directory to FQNs.
+     * Converts source files (extensions in
+     * {@link SourceExtensions#EXTENSIONS}) under a source-root directory
+     * to FQNs.
      */
     public static Set<String> fqnsUnder(Path sourceRoot) {
         LinkedHashMap<String, Path> result = new LinkedHashMap<>();
@@ -240,14 +255,12 @@ public final class SourceFileScanner {
                     if (attrs.isSymbolicLink()) {
                         return FileVisitResult.CONTINUE;
                     }
-                    if (file.toString().endsWith(".java")) {
+                    if (SourceExtensions.isSource(file.toString())) {
                         Path relative = sourceRoot.relativize(file);
                         String fqn = relative.toString()
                                 .replace(java.io.File.separatorChar, '.')
                                 .replace('/', '.');
-                        if (fqn.endsWith(".java")) {
-                            fqn = fqn.substring(0, fqn.length() - 5);
-                        }
+                        fqn = SourceExtensions.stripKnownExtension(fqn);
                         accumulator.putIfAbsent(fqn, file);
                     }
                     return FileVisitResult.CONTINUE;
@@ -291,7 +304,12 @@ public final class SourceFileScanner {
      * Derives a fully-qualified class name from a file path by finding the
      * first matching source directory suffix and stripping the prefix + suffix.
      *
-     * @param file       absolute path to the Java file
+     * <p>Both {@code .java} and {@code .kt} suffixes are stripped (PR #1
+     * of issue #76); files whose extension is not in
+     * {@link SourceExtensions#EXTENSIONS} return their dotted relative
+     * path verbatim, which the caller treats as a non-FQN signal.
+     *
+     * @param file       absolute path to the source file
      * @param sourceDirs source directory suffixes (e.g. {@code ["src/main/java"]})
      * @return the FQN, or {@code null} if no source dir matched
      */
@@ -304,9 +322,7 @@ public final class SourceFileScanner {
             int idx = filePath.indexOf(normalizedDir);
             if (idx >= 0) {
                 String relative = filePath.substring(idx + normalizedDir.length());
-                if (relative.endsWith(".java")) {
-                    relative = relative.substring(0, relative.length() - 5);
-                }
+                relative = SourceExtensions.stripKnownExtension(relative);
                 return relative.replace('/', '.');
             }
         }

@@ -449,4 +449,181 @@ class PathToClassMapperTest {
         assertTrue(result.unmappedChangedFiles().isEmpty(),
                 "No traversal warning should be emitted for legitimate names");
     }
+
+    // ── Phase 2 PR #1 of issue #76 — Kotlin path-derived mapping.
+    //    Behaviour pinned: .kt routes through tryMapToClass like
+    //    .java; production .kt files emit two FQNs (path-derived +
+    //    synthetic <basename>Kt); test .kt files emit only the
+    //    path-derived FQN; .kt outside source/test roots routes
+    //    to unmapped.
+
+    @Test
+    void mapsProductionKotlinFileToBothPathDerivedAndSyntheticFqn() {
+        Set<String> changed = Set.of("src/main/java/com/example/service/Util.kt");
+        MappingResult result = mapper.mapChangedFiles(changed);
+
+        assertTrue(result.productionClasses().contains("com.example.service.Util"),
+                "Path-derived FQN must be emitted for the explicit-class case");
+        assertTrue(result.productionClasses().contains("com.example.service.UtilKt"),
+                "Synthetic <basename>Kt FQN must be emitted so a Java test that "
+                        + "imports the compiled top-level-fn class (UtilKt) selects "
+                        + "via UsageStrategy tier-1 import lookup");
+        assertEquals(2, result.productionClasses().size(),
+                "Bounded over-selection: exactly two FQNs per production .kt — "
+                        + "any more and downstream strategies would do redundant probes. "
+                        + "Got: " + result.productionClasses());
+        assertTrue(result.testClasses().isEmpty());
+        assertTrue(result.changedProductionFiles().contains("src/main/java/com/example/service/Util.kt"));
+    }
+
+    @Test
+    void mapsTestKotlinFileToPathDerivedFqnOnly() {
+        // Production-only synthetic emission rule — see
+        // docs/PHASE-2-KOTLIN-AST.md §6 "Diff-side FQN for class-less
+        // Kotlin files." Emitting `FooTestKt` into testClasses would
+        // surface to the runner as "no tests found" because the
+        // compiler never produces a test class with that name.
+        Set<String> changed = Set.of("src/test/java/com/example/FooTest.kt");
+        MappingResult result = mapper.mapChangedFiles(changed);
+
+        assertEquals(Set.of("com.example.FooTest"), result.testClasses(),
+                "Test .kt must emit ONLY the path-derived FQN — "
+                        + "never the synthetic FooTestKt that names no real class");
+        assertTrue(result.productionClasses().isEmpty());
+        assertTrue(result.changedTestFiles().contains("src/test/java/com/example/FooTest.kt"));
+    }
+
+    @Test
+    void mapsMixedJavaAndKotlinDiff() {
+        Set<String> changed = Set.of(
+                "api/src/main/java/com/example/api/FooDto.java",
+                "core/src/main/java/com/example/core/Util.kt",
+                "core/src/test/java/com/example/core/UtilKtTest.kt"
+        );
+        MappingResult result = mapper.mapChangedFiles(changed);
+
+        assertTrue(result.productionClasses().contains("com.example.api.FooDto"));
+        assertTrue(result.productionClasses().contains("com.example.core.Util"));
+        assertTrue(result.productionClasses().contains("com.example.core.UtilKt"));
+        assertTrue(result.testClasses().contains("com.example.core.UtilKtTest"));
+        assertEquals(3, result.productionClasses().size());
+        assertEquals(1, result.testClasses().size());
+        assertTrue(result.unmappedChangedFiles().isEmpty());
+    }
+
+    @Test
+    void kotlinFileOutsideConfiguredSourceRootsRoutesToUnmapped() {
+        // Pre-PR-1 a .kt file went to unmapped because of the
+        // `!filePath.endsWith(".java")` guard. Post-PR-1 the file
+        // gets through that guard but then fails source/test-root
+        // matching — the unmapped fallthrough is what catches it.
+        Set<String> changed = Set.of("buildSrc/Util.kt");
+        MappingResult result = mapper.mapChangedFiles(changed);
+
+        assertTrue(result.productionClasses().isEmpty());
+        assertTrue(result.testClasses().isEmpty());
+        assertEquals(Set.of("buildSrc/Util.kt"), result.unmappedChangedFiles());
+    }
+
+    @Test
+    void formatKtClassFileEmitsBothPathDerivedAndPhantomSynthetic() {
+        // Edge case documented in docs/PHASE-2-KOTLIN-AST.md §6:
+        // a file named `FormatKt.kt` (perhaps containing
+        // `class FormatKt`) produces a phantom synthetic
+        // `FormatKtKt` that names no real class. Bounded harmless
+        // over-selection: NamingConventionStrategy probes
+        // `FormatKtKtTest` against the test-FQN universe and finds
+        // nothing (no test is ever named that), no real import
+        // string ever references the synthetic. Documented
+        // behaviour, not a bug.
+        Set<String> changed = Set.of("src/main/java/com/example/FormatKt.kt");
+        MappingResult result = mapper.mapChangedFiles(changed);
+
+        assertTrue(result.productionClasses().contains("com.example.FormatKt"));
+        assertTrue(result.productionClasses().contains("com.example.FormatKtKt"),
+                "Phantom synthetic is emitted unconditionally for *.kt files — "
+                        + "it costs one extra naming probe and adds no real-world "
+                        + "false positives; suppression is reserved for adopters "
+                        + "who route the file via outOfScopeSourceDirs.");
+    }
+
+    @Test
+    void kotlinFileUnderOutOfScopeSourceDirRoutesToOutOfScope() {
+        // Out-of-scope routing happens before the .kt extension check,
+        // so the existing escape hatch works for Kotlin too. Adopters
+        // who hit a noisy synthetic can configure outOfScopeSourceDirs
+        // exactly the same way they would for Java.
+        AffectedTestsConfig oosConfig = AffectedTestsConfig.builder()
+                .outOfScopeSourceDirs(java.util.List.of("legacy/**"))
+                .build();
+        PathToClassMapper oosMapper = new PathToClassMapper(oosConfig);
+
+        Set<String> changed = Set.of("legacy/src/main/java/com/example/Old.kt");
+        MappingResult result = oosMapper.mapChangedFiles(changed);
+
+        assertTrue(result.productionClasses().isEmpty(),
+                "OOS .kt must not contribute to productionClasses");
+        assertEquals(changed, result.outOfScopeFiles());
+    }
+
+    @Test
+    void mapsDefaultPackageKotlinFileToBothFqns() {
+        // Edge case: a Kotlin file with no package declaration,
+        // dropped at the immediate root of `src/main/java`. The
+        // path-derived FQN is just the basename — no dots. The
+        // synthetic emission is dot-count-agnostic (it's a string
+        // concatenation), so we should still get exactly two
+        // entries: `Util` and `UtilKt`. A future refactor that
+        // conditionally suppressed the synthetic when `prodFqn`
+        // has no dot would silently break this — pin the contract.
+        Set<String> changed = Set.of("src/main/java/Util.kt");
+        MappingResult result = mapper.mapChangedFiles(changed);
+
+        assertTrue(result.productionClasses().contains("Util"));
+        assertTrue(result.productionClasses().contains("UtilKt"));
+        assertEquals(2, result.productionClasses().size(),
+                "Default-package .kt must still emit both FQNs; got: "
+                        + result.productionClasses());
+    }
+
+    @Test
+    void coexistingJavaAndKotlinWithSameBasenameEmitDeduplicatedFqnsPlusSynthetic() {
+        // Java → Kotlin migration shape: a class converted from
+        // `Foo.java` to `Foo.kt` may transiently exist in both
+        // forms (or under different module paths during the
+        // migration). The path-derived FQN collides on
+        // `com.example.Foo`; the set deduplicates. The synthetic
+        // `FooKt` emits because of the .kt file. Both file paths
+        // surface in `changedProductionFiles` so downstream
+        // observability (--explain bucket sample, JSON output) can
+        // show the diff accurately.
+        Set<String> changed = Set.of(
+                "src/main/java/com/example/Foo.java",
+                "src/main/java/com/example/Foo.kt"
+        );
+        MappingResult result = mapper.mapChangedFiles(changed);
+
+        assertEquals(Set.of("com.example.Foo", "com.example.FooKt"),
+                result.productionClasses(),
+                "Java + Kotlin same-basename collision must produce exactly "
+                        + "{Foo, FooKt} — set semantics dedupe the path-derived "
+                        + "FQN, the synthetic comes from the .kt side only");
+        assertTrue(result.changedProductionFiles().contains("src/main/java/com/example/Foo.java"));
+        assertTrue(result.changedProductionFiles().contains("src/main/java/com/example/Foo.kt"));
+        assertEquals(2, result.changedProductionFiles().size());
+    }
+
+    @Test
+    void kotlinFileUnderIgnorePathRoutesToIgnored() {
+        AffectedTestsConfig ignoreConfig = AffectedTestsConfig.builder()
+                .ignorePaths(java.util.List.of("**/generated/**"))
+                .build();
+        PathToClassMapper ignoreMapper = new PathToClassMapper(ignoreConfig);
+
+        Set<String> changed = Set.of("src/main/java/com/example/generated/Auto.kt");
+        MappingResult result = ignoreMapper.mapChangedFiles(changed);
+
+        assertEquals(changed, result.ignoredFiles());
+        assertTrue(result.productionClasses().isEmpty());
+    }
 }
