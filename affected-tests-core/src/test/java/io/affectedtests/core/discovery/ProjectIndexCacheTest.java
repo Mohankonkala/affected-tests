@@ -258,6 +258,164 @@ class ProjectIndexCacheTest {
     }
 
     @Test
+    void kotlinEnabledFlagFlipInvalidatesCache() throws Exception {
+        // Phase 2 PR #3 of issue #76: the rollout flag
+        // {@link AffectedTestsConfig#kotlinEnabled()} feeds into
+        // {@link ProjectIndexCache#configHash} so a flag flip
+        // (off → on or on → off) forces a cache miss. Without this,
+        // the file-extension scope the scanner walks would be
+        // unchanged across the flip but the parser-side dispatch
+        // ({@link LanguageParsers#forConfig}) would suddenly route
+        // {@code .kt} files through the AST extractor — and the
+        // strategies' match keys would change overnight while the
+        // cache served pre-AST data.
+        //
+        // Asserting the configHash itself differs is the cheapest
+        // pin: the load path's body is heavily exercised by the
+        // other tests in this file. If the hash changes, a future
+        // refactor that accidentally drops the kotlinEnabled bit
+        // from the configHash mix goes red here, not as a
+        // mysterious behavioural drift on adopter sites.
+        writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
+                "package com.example; public class FooTest {}");
+
+        AffectedTestsConfig flagOff = AffectedTestsConfig.builder()
+                .mode(Mode.CI)
+                .kotlinEnabled(false)
+                .build();
+        AffectedTestsConfig flagOn = AffectedTestsConfig.builder()
+                .mode(Mode.CI)
+                .kotlinEnabled(true)
+                .build();
+
+        String hashOff = ProjectIndexCache.configHash(flagOff);
+        String hashOn = ProjectIndexCache.configHash(flagOn);
+        assertNotEquals(hashOff, hashOn,
+                "configHash must differ across kotlinEnabled flips. "
+                        + "Identical hashes would cause a warm cache to "
+                        + "serve pre-flip metadata after the flag flips, "
+                        + "which is the silent-stale-data class of bug "
+                        + "PR #3's 'fail-closed when escalation is needed' "
+                        + "posture is meant to catch.");
+
+        // End-to-end behavioural check: build with flagOff (cache
+        // populated under that hash), then build with flagOn — the
+        // second build must take the miss path because configHash
+        // changed.
+        ProjectIndex.build(projectDir, flagOff);
+        Path snapshot = projectDir.resolve("build/affected-tests/index/v1/snapshot.tsv");
+        assertTrue(Files.isRegularFile(snapshot));
+        FileTime initialMtime = Files.getLastModifiedTime(snapshot);
+
+        // Sleep just long enough that filesystems with second-resolution
+        // mtime can record a different timestamp on the rewrite. The
+        // existing `configChangeInvalidatesCache` test uses the same
+        // posture; mirror it.
+        Thread.sleep(1100);
+
+        ProjectIndex.build(projectDir, flagOn);
+        FileTime afterMtime = Files.getLastModifiedTime(snapshot);
+        assertNotEquals(initialMtime, afterMtime,
+                "Snapshot mtime must advance: kotlinEnabled flip caused a "
+                        + "cache miss → fresh build → snapshot rewrite. If "
+                        + "mtime is unchanged the configHash branch is not "
+                        + "rejecting the warm cache.");
+    }
+
+    @Test
+    void prePr3SchemaSnapshotInvalidatesAndForcesFullRescan() throws Exception {
+        // Phase 2 PR #3 of issue #76: bumped SCHEMA_VERSION 3 → 4 because
+        // FileMetadataRow's serialised shape is about to start carrying
+        // Kotlin-AST-derived fields (the `kotlinEnabled` flag in
+        // {@link AffectedTestsConfig#configHash()} also feeds into the
+        // hash, so flipping the flag forces a separate cache miss). A
+        // forward-incompatible row shape served through a pre-PR-3
+        // reader would surface as parse exceptions during
+        // {@link ProjectIndexCache.FileMetadataRow#parse} or — worse —
+        // silently mis-typed metadata that flows into Usage /
+        // Implementation / Transitive's match keys.
+        //
+        // The rescan path is the only mechanism that guarantees the
+        // post-PR-3 reader never sees pre-PR-3 row data on warm caches
+        // across the upgrade boundary. This test hand-writes a v=3
+        // snapshot whose contents are deliberately wrong (no test FQN
+        // entries) and asserts the {@link ProjectIndexCache#tryLoad}
+        // schemaVersion check is the load-bearing rejection signal —
+        // not the dir-fingerprint check or the configHash check or the
+        // FileMetadataRow.parse step further down.
+        writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
+                "package com.example; public class FooTest {}");
+        Files.createDirectories(projectDir.resolve("src/test/java/com/example"));
+        Files.writeString(projectDir.resolve("src/test/java/com/example/BarTest.kt"),
+                "package com.example\nclass BarTest");
+
+        Path cacheDir = projectDir.resolve("build/affected-tests/index/v1");
+        Files.createDirectories(cacheDir);
+        // Hand-rolled v=3 snapshot. As with the pre-PR-1 test above,
+        // the body is deliberately stale (no testFqn entries); a
+        // permissive schema check would adopt this and downstream
+        // strategies would silently under-select FooTest + BarTest.
+        Files.writeString(cacheDir.resolve("snapshot.tsv"),
+                "v\t3\ncfg\twillbeoverwritten\n");
+
+        ProjectIndex index = ProjectIndex.build(projectDir, BASE_CONFIG);
+
+        assertTrue(index.testFqns().contains("com.example.FooTest"),
+                "Java test FQN must surface from the rescan when a stale "
+                        + "v=3 snapshot exists. The schemaVersion check at "
+                        + "ProjectIndexCache.tryLoad must reject the v=3 "
+                        + "snapshot before the load path even attempts to "
+                        + "parse the (deliberately stale) body. Got: "
+                        + index.testFqns());
+        assertTrue(index.testFqns().contains("com.example.BarTest"),
+                "Kotlin test FQN must surface from the rescan — pre-PR-3 "
+                        + "→ post-PR-3 upgrade with a warm cache is exactly "
+                        + "the scenario the schema bump exists to catch. "
+                        + "Got: " + index.testFqns());
+    }
+
+    @Test
+    void postUpgradeFutureSchemaSnapshotInvalidatesAndForcesFullRescan() throws Exception {
+        // Symmetric direction of the schema-version safety check at
+        // {@link ProjectIndexCache#tryLoad}: a v=N+1 snapshot
+        // (post-upgrade plugin produced a future schema, then the
+        // CI matrix downgraded back to the current version, e.g.
+        // during a rolling rollout) must also be rejected. The
+        // existing pre-PR-1 / pre-Phase-2 / pre-PR-3 tests cover
+        // the too-old direction; without this companion the
+        // schema check could silently regress to a one-sided
+        // {@code <} comparison and accept a future-shaped row
+        // shape through a current-shaped reader — exactly the
+        // silent-stale-data class of bug the schema bump exists
+        // to prevent. The early-out in {@link Snapshot#read}
+        // also shoulders the diagnostic-quality contract: a v=5
+        // body whose rows are wire-incompatible with v=4 surfaces
+        // as a clean "schemaVersion mismatch" log line rather
+        // than as "failed to read snapshot".
+        writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
+                "package com.example; public class FooTest {}");
+
+        Path cacheDir = projectDir.resolve("build/affected-tests/index/v1");
+        Files.createDirectories(cacheDir);
+        // Hand-rolled v=5 snapshot. Body is deliberately stale (no
+        // testFqn entries); a permissive {@code <} check would
+        // adopt this and downstream strategies would silently
+        // under-select FooTest.
+        Files.writeString(cacheDir.resolve("snapshot.tsv"),
+                "v\t5\ncfg\twillbeoverwritten\n");
+
+        ProjectIndex index = ProjectIndex.build(projectDir, BASE_CONFIG);
+
+        assertTrue(index.testFqns().contains("com.example.FooTest"),
+                "Test FQN must surface from the rescan when a v=5 "
+                        + "future-schema snapshot exists. The schemaVersion "
+                        + "check at tryLoad must reject the v=5 snapshot — "
+                        + "downgrade across a CI matrix boundary cannot "
+                        + "feed future-shaped rows to a current-shaped "
+                        + "reader. Got: " + index.testFqns());
+    }
+
+    @Test
     void disableViaSystemPropertyBypassesCache() throws Exception {
         writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
                 "package com.example; public class FooTest {}");

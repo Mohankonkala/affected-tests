@@ -243,7 +243,11 @@ public final class ImplementationStrategy implements TestDiscoveryStrategy {
         if (index != null) {
             return index.fileMetadata(file);
         }
-        return LanguageParsers.parseOrWarn(file, "impl");
+        // Standalone fallback (no engine-supplied registry) routes
+        // through {@link LanguageParsers#defaultJavaOnly()}; see
+        // {@link UsageStrategy#metadataOrGet} for the per-engine-vs-
+        // standalone rationale.
+        return LanguageParsers.defaultJavaOnly().parseOrWarn(file, "impl");
     }
 
     /**

@@ -14,24 +14,213 @@ plugins {
 
 dependencies {
     implementation project(':affected-tests-core')
+
+    // Phase 2 (issue #76, PR #3) — Kotlin AST support. The gradle
+    // module is the one whose shadowJar ships to the Plugin Portal /
+    // Maven Central, so the embeddable + its transitive runtime deps
+    // need to land on this module's runtime classpath for the shadow
+    // task to pick them up. Core declares the same coordinate as
+    // compileOnly because its runtime is satisfied by the shaded JAR
+    // at adopter sites. Pinned version policy: see
+    // docs/PHASE-2-KOTLIN-AST.md §4.
+    implementation 'org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.20'
 }
 
 version = rootProject.version
 
 // Shadow the core library into the plugin JAR so consumers don't need to resolve it separately.
-// Relocate to avoid classpath conflicts with user's own JGit/JavaParser versions.
+// Relocate to avoid classpath conflicts with the user's own JGit / JavaParser / Kotlin
+// compiler versions, and bundle the Kotlin compiler embeddable + its pre-relocated IntelliJ
+// Platform / ASM / fastutil / jline transitive payload under a single
+// `io.affectedtests.shadow.*` namespace.
 //
 // With plugin-publish 2.0+ and Shadow 9.x, plugin-publish automatically detects Shadow
 // and publishes the shadow JAR as the plugin artifact. We only need to:
 // 1. Set archiveClassifier to '' so the shadow JAR replaces the default JAR
 // 2. Disable the default jar task to avoid classifier collisions
-// 3. Configure relocations
+// 3. Configure relocations + minimize-with-excludes
 // See: https://gradleup.com/shadow/publishing/#publishing-the-shadowed-gradle-plugins
+//
+// === Phase 2 / issue #76 / PR #3 — Kotlin embeddable shading ===
+//
+// `relocate` ordering is load-bearing. Shadow 9.x evaluates relocators via
+// `Iterable<Relocator>.relocateClass` (verified against `RelocationContext.kt` at the
+// pinned 9.4.1 tag) which iterates rules in DSL-insertion order and short-circuits on the
+// first relocator whose `canRelocateClass` returns true. The more-specific
+// `org.jetbrains.kotlin.com.intellij` (and siblings) MUST appear before the outer
+// `org.jetbrains.kotlin` — putting the outer rule first would double-relocate every
+// `com.intellij.*` class. The verification gate
+// (`ShadowRelocationFunctionalTest` zip-walk) asserts the post-shading namespace shape
+// to keep this ordering honest.
+//
+// The `minimize { }` block is purely defensive against a future build accidentally
+// pruning reflection-reached classes in the bundled compilers / parsers; it explicitly
+// excludes every dep we ship so minimize is effectively a no-op for size in the current
+// configuration. Realistic post-shading size is 40–50 MB (the original 28–35 MB target
+// was wishful — minimize cannot prune the embeddable's reflection / service-loader /
+// extension-XML reachability graph). Hard ceiling is 60 MB; PR #3's prototype build
+// records the actual figure in the PR description (see docs/PHASE-2-KOTLIN-AST.md §5).
 shadowJar {
     archiveClassifier.set('')
-    relocate 'org.eclipse.jgit', 'io.affectedtests.shadow.jgit'
-    relocate 'com.github.javaparser', 'io.affectedtests.shadow.javaparser'
-    relocate 'org.slf4j', 'io.affectedtests.shadow.slf4j'
+
+    // Pre-Phase-2 relocations (shipped before issue #76 PR #3).
+    relocate 'org.eclipse.jgit',                            'io.affectedtests.shadow.jgit'
+    relocate 'com.github.javaparser',                       'io.affectedtests.shadow.javaparser'
+    relocate 'org.slf4j',                                   'io.affectedtests.shadow.slf4j'
+
+    // Phase 2 (issue #76, PR #3) — Kotlin embeddable + its bundled IntelliJ /
+    // JetBrains-internal copies. Order matters: place the already-relocated
+    // 'org.jetbrains.kotlin.com.intellij' (and siblings) before the outer
+    // 'org.jetbrains.kotlin' rule so the outer rule does not double-relocate
+    // those classes.
+    relocate 'org.jetbrains.kotlin.com.intellij',           'io.affectedtests.shadow.kotlin.com.intellij'
+    relocate 'org.jetbrains.kotlin.it.unimi.dsi.fastutil',  'io.affectedtests.shadow.kotlin.fastutil'
+    relocate 'org.jetbrains.kotlin.org.jline',              'io.affectedtests.shadow.kotlin.jline'
+    relocate 'org.jetbrains.kotlin',                        'io.affectedtests.shadow.kotlin'
+    // `kotlin.*` covers the kotlin stdlib + the embeddable's bundled
+    // `kotlin/*.kotlin_builtins` resources. Shadow rewrites both the resource paths AND
+    // the bytecode-level string constants the BuiltInsLoader uses to look those resources
+    // up at runtime.
+    relocate 'kotlin',                                      'io.affectedtests.shadow.kotlinstdlib'
+
+    // Embeddable's POM pulls these as runtime deps; neither falls under any of the four
+    // 'kotlin' / 'org.jetbrains.kotlin' prefixes above so each needs its own rule.
+    relocate 'kotlinx.coroutines',                          'io.affectedtests.shadow.kotlinx.coroutines'
+    relocate 'gnu.trove',                                   'io.affectedtests.shadow.trove4j'
+
+    // Additional unrelocated leaks observed in the 2.1.20 embeddable's class graph
+    // (probed via `unzip -l` on the prototype shadow JAR; see PR #3 description for
+    // the inventory). Each rule covers a class root that the plan §5 recipe missed:
+    //
+    //  * `org.jetbrains.org.objectweb.asm` — JetBrains' pre-relocated ObjectWeb ASM
+    //    bundled inside the embeddable. Without this rule, an adopter shipping their
+    //    own ASM under `org.objectweb.asm` is unaffected (the embeddable's ASM is
+    //    pre-relocated under `org.jetbrains.org`), but the namespace still leaks
+    //    `org.jetbrains.*` symbols into the plugin classpath unless explicitly
+    //    rewritten.
+    //  * `org.jetbrains.concurrency` — JetBrains' Promise / CancellablePromise
+    //    helpers used by the IntelliJ Platform shim inside the embeddable.
+    //  * `org.jetbrains.annotations` and `org.intellij.lang.annotations` — runtime
+    //    annotations (Nullable, NotNull, Language, etc.) the embeddable's bytecode
+    //    references. Source-retention annotations would not need shading, but
+    //    these are runtime-retention so shadow rewrites every bytecode reference.
+    //  * `_COROUTINE` — kotlinx-coroutines stack-frame marker package. The package
+    //    name starts with an underscore so it cannot match a normal Java identifier
+    //    in source, but shadow can still rewrite bytecode-level references.
+    //    Coroutine debugging continues to work because the marker classes are still
+    //    present, just under the relocated namespace.
+    relocate 'org.jetbrains.org.objectweb',                 'io.affectedtests.shadow.kotlin.asm'
+    relocate 'org.jetbrains.concurrency',                   'io.affectedtests.shadow.kotlin.concurrency'
+    relocate 'org.jetbrains.annotations',                   'io.affectedtests.shadow.kotlin.annotations'
+    relocate 'org.intellij.lang.annotations',               'io.affectedtests.shadow.kotlin.intellij.annotations'
+    relocate '_COROUTINE',                                  'io.affectedtests.shadow.coroutine_marker'
+
+    // Path-based excludes target compiler subsystems the JVM-PSI parser bootstrap
+    // does not exercise. Probed empirically via the parse-gate functional test
+    // (`ShadowParseGateFunctionalTest`) — every exclude here was tightened in
+    // response to a `NoClassDefFoundError` / `Missing extension point: ...`
+    // surfaced by that gate against an over-aggressive earlier pruning attempt.
+    // Keeping the subsystems below would push the JAR past the 60 MB hard
+    // ceiling Plan §5 / "JAR Size Budget" commits to; pruning ANYTHING beyond
+    // them risks the bootstrap-extension-point class graph
+    // ({@code KotlinCoreEnvironment.Companion.registerPluginExtensionPoints})
+    // referencing a missing class.
+    //
+    // What stays in the JAR (NOT excluded):
+    //   * `org/jetbrains/kotlin/fir/**` — K2 frontend. The Companion's
+    //     registerExtensionsFromPlugins call references FIR extension-point
+    //     marker classes during bootstrap even when we drive the FE2 / PSI
+    //     frontend, so removing FIR breaks the bootstrap.
+    //   * `org/jetbrains/kotlin/ir/**` + `psi2ir/**` + `backend/**` +
+    //     `codegen/**` — JVM bytecode generation surface. The IR /
+    //     code-generation extension points
+    //     ({@code ClassBuilderInterceptorExtension}, {@code IrGenerationExtension},
+    //     etc.) are registered at every {@code createForProduction} call;
+    //     pruning their declaring packages surfaces as
+    //     {@code NoClassDefFoundError} on the very first
+    //     {@code KotlinCoreEnvironment.<init>} entry.
+    //
+    // What goes (excluded):
+    //   * JS / Native / WASM compilers — separate codegen targets the JVM
+    //     bootstrap doesn't reference. Their extension points are JVM-isolated,
+    //     not registered through the JVM_CONFIG_FILES code path PR #3 uses.
+    //   * Compiler daemon — we never daemonise the embeddable; PSI parsing
+    //     is in-process per discovery run.
+    //
+    // Each pattern is a SOURCE path (pre-relocation). Shadow's `exclude` runs
+    // against the merged input JAR before the relocator rewrites bytecode;
+    // using `org/jetbrains/kotlin/...` here matches the embeddable's own layout.
+    exclude 'org/jetbrains/kotlin/js/**'                 // Kotlin/JS compiler
+    exclude 'org/jetbrains/kotlin/konan/**'              // Kotlin/Native compiler
+    exclude 'org/jetbrains/kotlin/wasm/**'               // Kotlin/WASM compiler
+    exclude 'org/jetbrains/kotlin/daemon/**'             // compiler daemon (we never daemonise)
+    exclude 'org/jetbrains/kotlin/serialization/js/**'   // JS-specific serialization payload
+    exclude 'org/jetbrains/kotlin/serialization/konan/**' // Native-specific serialization payload
+    exclude 'org/jetbrains/kotlin/backend/wasm/**'       // WASM bytecode backend
+    exclude 'org/jetbrains/kotlin/backend/konan/**'      // Native bytecode backend
+
+    // Phase 2 / PR #3 — granular FIR/IR pruning to bring the JAR under 60 MB.
+    // The K2 / FIR + IR-codegen frontends are the heaviest single subsystems still
+    // present after the JS/Native/WASM/daemon excludes; pruning their analysis +
+    // resolution + bytecode-backend subpackages while keeping their
+    // extension-point marker subpackages (`fir/extensions/**`, `ir/visitors/**`,
+    // etc.) is the difference between a 64.8 MB JAR (bootstraps but breaches
+    // the ceiling) and a ~45 MB JAR that fits Plan §5's 40-50 MB target window.
+    // Each rule below was added in response to a packet-by-packet measurement
+    // pass; if a future embeddable upgrade re-shapes any of these, the parse-gate
+    // functional test catches the breakage at the ClassNotFoundException level.
+    //
+    //   fir/analysis     — diagnostic checkers; not on the PSI parse path.
+    //   fir/resolve      — type / name resolution; PSI parsing stops before resolve.
+    //   fir/backend      — FIR → IR lowering; not invoked from PSI bootstrap.
+    //   fir/serialization
+    //   fir/deserialization — serialised FIR I/O; not invoked from PSI bootstrap.
+    //   ir/backend/js    — Kotlin/JS-specific IR nodes (we already exclude js/**
+    //                      but ir/backend/js is a separate package).
+    //   ir/interpreter   — IR constant-expression evaluator; only needed at codegen.
+    //   ir/inline        — inlining transformer; only needed at codegen.
+    exclude 'org/jetbrains/kotlin/fir/analysis/**'
+    exclude 'org/jetbrains/kotlin/fir/resolve/**'
+    exclude 'org/jetbrains/kotlin/fir/backend/**'
+    exclude 'org/jetbrains/kotlin/fir/serialization/**'
+    exclude 'org/jetbrains/kotlin/fir/deserialization/**'
+    exclude 'org/jetbrains/kotlin/ir/backend/js/**'
+    exclude 'org/jetbrains/kotlin/ir/interpreter/**'
+    exclude 'org/jetbrains/kotlin/ir/inline/**'
+
+    minimize {
+        // Pre-PR-3 the build had no `minimize { }` block, so JGit / JavaParser / slf4j
+        // shipped whole. Adding `minimize` would prune their reflection-reached classes
+        // too — JavaParser's symbol-solver and JGit's transports both register via
+        // `META-INF/services/*`. Exclude all three en masse so the new block is purely
+        // additive for the embeddable closure.
+        exclude(dependency('org.eclipse.jgit:.*'))
+        exclude(dependency('com.github.javaparser:.*'))
+        exclude(dependency('org.slf4j:.*'))
+
+        // Embeddable + each transitive dep on its POM. Without an exclude per dep,
+        // `minimize` prunes class-graph-unreachable classes from each dependency
+        // independently — the PSI bootstrap reaches many of those classes only via XML
+        // extension descriptors (META-INF/extensions/*.xml) that the class-graph walk
+        // cannot see, so partial pruning surfaces as
+        // `IllegalArgumentException: Missing extension point: ...` on the first parse.
+        // The path-level `exclude` rules above are the size-cutting mechanism; this
+        // block is a safety net that keeps minimize from second-order pruning anything
+        // the path excludes leave behind.
+        exclude(dependency('org.jetbrains.kotlin:kotlin-compiler-embeddable:.*'))
+        exclude(dependency('org.jetbrains.kotlin:kotlin-stdlib:.*'))
+        exclude(dependency('org.jetbrains.kotlin:kotlin-reflect:.*'))
+        exclude(dependency('org.jetbrains.kotlin:kotlin-script-runtime:.*'))
+        exclude(dependency('org.jetbrains.kotlin:kotlin-daemon-embeddable:.*'))
+        exclude(dependency('org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:.*'))
+        exclude(dependency('org.jetbrains.intellij.deps:trove4j:.*'))
+    }
+
+    // mergeServiceFiles invokes Shadow's `ServiceFileTransformer` which both (a) merges
+    // overlapping META-INF/services entries across input JARs, and (b) rewrites the
+    // service-file basename AND body using the active relocation map. Without this the
+    // embeddable's service files (BuiltInsLoader, ExternalOverridabilityCondition, etc.)
+    // would still claim `org.jetbrains.kotlin.*` FQNs that no longer exist at runtime.
     mergeServiceFiles()
 }
 
@@ -89,6 +278,21 @@ tasks.register('functionalTest', Test) {
     // explicitly so step definitions get picked up deterministically.
     systemProperty 'cucumber.glue', 'io.affectedtests.gradle.e2e.steps'
     systemProperty 'cucumber.publish.quiet', 'true'
+
+    // Phase 2 (issue #76, PR #3) — surface the shadow JAR's path so
+    // `ShadowRelocationFunctionalTest` can ZipFile-walk the actual built JAR
+    // (asserting the post-relocation namespace shape) and the end-to-end
+    // parse-gate test can load it in an isolated classloader. Without the
+    // explicit dependency the JAR might not exist when the test runs (e.g.
+    // a fresh checkout running `:functionalTest` without first running
+    // `:shadowJar`); without the system property the test would have to
+    // hardcode `build/libs/...` which would break under custom layout
+    // directories.
+    dependsOn tasks.named('shadowJar')
+    def shadowJarFile = tasks.named('shadowJar').get().archiveFile
+    inputs.file(shadowJarFile)
+    systemProperty 'affectedTests.shadowJar.path',
+            shadowJarFile.get().asFile.absolutePath
 }
 
 tasks.named('check') {

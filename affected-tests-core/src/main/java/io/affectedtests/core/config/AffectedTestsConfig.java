@@ -57,6 +57,7 @@ public final class AffectedTestsConfig {
     private final Map<Situation, Action> situationActions;
     private final Map<Situation, ActionSource> situationActionSources;
     private final boolean parallelDiscovery;
+    private final boolean kotlinEnabled;
 
     private AffectedTestsConfig(Builder builder) {
         this.baseRef = builder.baseRef;
@@ -92,6 +93,7 @@ public final class AffectedTestsConfig {
         this.situationActions = resolved.actions;
         this.situationActionSources = resolved.sources;
         this.parallelDiscovery = builder.parallelDiscovery;
+        this.kotlinEnabled = builder.kotlinEnabled;
     }
 
     /** Parallel pair returned from the situation-action resolver. */
@@ -210,6 +212,39 @@ public final class AffectedTestsConfig {
      * fallback and is what the existing functional tests exercise.
      */
     public boolean parallelDiscovery() { return parallelDiscovery; }
+
+    /**
+     * Whether the Kotlin AST-driven parser is registered for {@code .kt}
+     * files (issue #76 Phase 2, PR #3). Defaults to {@code false} during
+     * the rollout window; PR #4 flips the default to {@code true} and
+     * removes this knob.
+     *
+     * <p>When {@code false}, {@code .kt} files keep the Phase 1 (PR #1)
+     * shape: path-derived FQN routing on the diff side, no AST-driven
+     * strategy participation. {@code DISCOVERY_INCOMPLETE} does not
+     * trigger for unparsed Kotlin in this mode — the absence is
+     * "by design" in the rollout phase, not a parse failure.
+     *
+     * <p>When {@code true}, {@code KotlinLanguageParser} is registered
+     * with the per-engine {@code LanguageParsers} registry; AST-driven
+     * strategies (Usage / Implementation / Transitive) start producing
+     * matches for Kotlin files; embeddable bootstrap failures fail
+     * closed via the {@link Situation#DISCOVERY_INCOMPLETE} escalation
+     * path (the WARN is logged once and every {@code .kt} in the run
+     * is treated as unparseable).
+     *
+     * <p>Wired from the system property
+     * {@code -Daffected-tests.kotlin.enabled=true} via
+     * {@code ProviderFactory.systemProperty(...)} at task-execution
+     * time so the read is configuration-cache compatible. The flag
+     * value participates in
+     * {@link io.affectedtests.core.discovery.ProjectIndexCache#configHash(AffectedTestsConfig)}
+     * so a flip across consecutive runs forces a full rescan rather
+     * than reusing a half-Kotlin-shaped cache.
+     *
+     * @return whether Kotlin AST parsing is enabled for this run
+     */
+    public boolean kotlinEnabled() { return kotlinEnabled; }
     public List<String> testSuffixes() { return testSuffixes; }
     public List<String> sourceDirs() { return sourceDirs; }
     public List<String> testDirs() { return testDirs; }
@@ -431,6 +466,14 @@ public final class AffectedTestsConfig {
         // false without touching code via -PaffectedTestsParallelDiscovery=false.
         private boolean parallelDiscovery = true;
 
+        // Issue #76 Phase 2 PR #3 — Kotlin AST parser is gated behind
+        // -Daffected-tests.kotlin.enabled=true while the rollout is in
+        // flight. Default OFF so adopters who upgrade across the PR
+        // boundary keep the Phase 1 (path-derived) behaviour until they
+        // explicitly opt in. PR #4 removes the gate and flips the
+        // default to ON. See docs/PHASE-2-KOTLIN-AST.md §9.
+        private boolean kotlinEnabled = false;
+
         private Mode mode;
         private Action onEmptyDiff;
         private Action onAllFilesIgnored;
@@ -560,6 +603,11 @@ public final class AffectedTestsConfig {
          * @see AffectedTestsConfig#parallelDiscovery()
          */
         public Builder parallelDiscovery(boolean v) { this.parallelDiscovery = v; return this; }
+
+        /**
+         * @see AffectedTestsConfig#kotlinEnabled()
+         */
+        public Builder kotlinEnabled(boolean v) { this.kotlinEnabled = v; return this; }
         public Builder testSuffixes(List<String> v) {
             this.testSuffixes = Objects.requireNonNull(v, "testSuffixes must not be null");
             return this;

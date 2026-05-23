@@ -382,7 +382,11 @@ public final class TransitiveStrategy implements TestDiscoveryStrategy {
         if (index != null) {
             return index.fileMetadata(file);
         }
-        return LanguageParsers.parseOrWarn(file, "transitive");
+        // Standalone fallback (no engine-supplied registry) routes
+        // through {@link LanguageParsers#defaultJavaOnly()}; see
+        // {@link UsageStrategy#metadataOrGet} for the per-engine-vs-
+        // standalone rationale.
+        return LanguageParsers.defaultJavaOnly().parseOrWarn(file, "transitive");
     }
 
     private String pathToFqn(Path file) {

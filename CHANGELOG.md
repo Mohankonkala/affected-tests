@@ -6,6 +6,175 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Kotlin AST parser (issue #76, PR #3 of Phase 2)
+
+Wires `kotlin-compiler-embeddable:2.1.20` into the discovery engine
+through a new `KotlinLanguageParser` registered behind the
+`affected-tests.kotlin.enabled` system property. The flag defaults
+to **off** for the rollout window — every `.kt` file still flows
+through the path-derived FQN routing PR #1 introduced, and existing
+adopters see zero behavioural change. Flipping the flag to `true`
+routes `.kt` parsing through the embeddable's PSI walk, producing
+the same `FileMetadata` shape (`packageName`, `primaryTypeName`,
+imports, type-reference simple + dotted names, type declarations
+with supertype names) the Java path produces. PR #4 will flip the
+default.
+
+PR #3 ships:
+
+- A package-private `KotlinLanguageParser` in
+  `io.affectedtests.core.discovery` that owns the embeddable's
+  `KotlinCoreEnvironment` lifecycle (lazy bootstrap on first
+  parse, single shared environment per `ProjectIndex`, deterministic
+  disposal via `AutoCloseable`). Bootstrap failure routes to a
+  single `WARN` line + the fail-closed posture the plan specifies:
+  every `.kt` parse in the run returns `null`, the parse-failure
+  counter bumps once per file, and `Situation.DISCOVERY_INCOMPLETE`
+  decides whether the run escalates. Silent degradation to "Kotlin
+  file, naming-strategy only" is forbidden — that's the silent-skip
+  class of bug Phase 1 was written to avoid.
+- A real PSI walk producing `FileMetadata` at parity with the
+  Java extractor. Class-less `.kt` files surface the JVM-facade
+  synthetic name (`<basename>Kt`) the Kotlin compiler emits at
+  bytecode level; named companions surface as their own
+  `TypeDecl`; anonymous companions (`companion object {}`) are
+  filtered out so the over-generic `Companion` simple name does
+  not over-match. Nullable wrappers (`Foo?`) and qualified user
+  types (`com.example.Bar`) both contribute to the
+  simple-name and dotted-name harvest. `@file:JvmName(...)` is
+  detected and surfaced for `--explain`, but **not honoured** in
+  Phase 2 — a follow-up issue tracks honouring the override.
+- A `LanguageParsers` registry refactored from a static utility
+  to a per-engine instance owning the lifecycle of every
+  registered parser. Strategies' no-index fallback path uses
+  `LanguageParsers.defaultJavaOnly()` (the rollout-default shape);
+  the engine's index-aware path uses
+  `LanguageParsers.forConfig(config)` which conditionally
+  registers the Kotlin parser based on `kotlinEnabled`.
+  `ProjectIndex` implements `AutoCloseable` and
+  `AffectedTestsEngine.discover` wraps `ProjectIndex.build` in a
+  try-with-resources so the embeddable's MockApplication +
+  extension-point registry get disposed at engine shutdown even
+  on the abnormal-exit path.
+- A schema bump on `ProjectIndexCache.SCHEMA_VERSION` (3 → 4)
+  plus the `kotlinEnabled` flag mixed into `configHash`. Both
+  invalidate any pre-PR-3 warm cache automatically: a flag flip
+  produces a fresh `configHash`, and a cross-version upgrade
+  rejects the pre-PR-3 snapshot at the schema check before the
+  load path even attempts to parse the body.
+- Shading config in `affected-tests-gradle/build.gradle` that
+  bundles the embeddable + its pre-relocated IntelliJ Platform /
+  ASM / fastutil / jline / vavr payload under
+  `io.affectedtests.shadow.*`. The published shadow JAR measures
+  **55.7 MB** (well under Plan §5's 60 MB hard ceiling, inside
+  the 40-50 MB realistic target window). Adopters with their own
+  Kotlin compiler / ASM / coroutines on the build classpath are
+  unaffected — every relocated namespace is verified by a
+  ZIP-walk functional test against an exhaustive forbidden-root
+  list.
+- Three new functional tests:
+  `ShadowRelocationFunctionalTest` (structural ZIP-walk gate over
+  the published JAR — namespace shape, service-file rewrite,
+  size ceiling); `ShadowParseGateFunctionalTest` (runtime gate
+  loading the shaded JAR in an isolated child-first classloader
+  and reflectively bootstrapping `KotlinCoreEnvironment` against
+  a representative fixture); plus 16 `KotlinLanguageParserTest`
+  unit cases pinning the PSI walk's contract (synthetic facade
+  naming, nullable handling, anonymous-companion filter, nested
+  type recursion, supertype harvest, FQN inline references,
+  `@file:JvmName` flag, post-close fail-closed, idempotent
+  disposal).
+
+#### Post-review hardening
+
+A multi-persona code review of the original PR #3 surfaced a
+cluster of correctness, reliability, and adversarial findings that
+all landed in this commit before merge:
+
+- **Per-file `Throwable` catch.** `parseOrWarn`'s exception handler
+  widened from `Exception` to `Throwable` so `StackOverflowError`
+  (deeply nested generics), `OutOfMemoryError` (multi-GB single-line
+  source), and `AssertionError` (embeddable PSI invariant violations)
+  fail-closed at the file level instead of crashing the engine —
+  matches the bootstrap layer's posture and removes the asymmetry an
+  adversarial review flagged as exploitable.
+- **PsiErrorElement gate.** `KtPsiFactory.createFile` returns a
+  walkable `KtFile` even for malformed input — syntax errors surface
+  as `PsiErrorElement` nodes, not exceptions. The extractor now
+  walks for any `PsiErrorElement` and treats its presence as a parse
+  failure, mirroring Java's `ParseResult.isSuccessful()` gate. Without
+  this gate an in-flight broken `.kt` edit would silently produce
+  partial `FileMetadata` and under-select tests — exactly the
+  silent-drop class of bug Phase 2 §3.4 was written to forbid.
+- **Close-vs-bootstrap race.** `close()` now acquires
+  `bootstrapLock` for the field-read window so a concurrent
+  in-flight bootstrap cannot publish a live environment after
+  disposal returns, eliminating a ~25 MB MockApplication leak per
+  occurrence on a long-running Gradle daemon. `ensureEnvironment`
+  re-checks both `bootstrapFailed` and `closed` inside the
+  synchronized block so threads queued on `bootstrapLock` exit
+  cleanly instead of re-attempting a known-failed bootstrap.
+- **Half-constructed Disposable.** Bootstrap failure now disposes
+  the `Disposable parent` token before propagating null — without
+  this, `KotlinCoreEnvironment.createForProduction` registering
+  child disposables before throwing left a stranded entry in
+  IntelliJ's static `Disposer` registry.
+- **`companion object Companion {}` filter.** Code generators (KSP,
+  Mockito-Kotlin, Hilt) emit explicitly-named `Companion`
+  companions; the original anonymous-only filter let these slip
+  through as `TypeDecl{simpleName="Companion"}`, over-matching every
+  Kotlin file with a companion. The filter now uses both signals
+  (anonymous OR explicit-name-equals-`Companion`).
+- **`derivePrimaryTypeName` prefers class over object.** A file
+  shaped like `object Singleton; class TheClass` now surfaces
+  `TheClass` as the primary type — aligning the parser-side FQN
+  with the diff-side `PathToClassMapper`'s file-stem-derived FQN
+  for the same file. Falls back to the first object only when the
+  file declares no top-level class.
+- **Trailing-dot bail in `qualifiedName`.** The qualifier-chain walk
+  now bails before appending a joining `.` when the leaf
+  `referencedName` is null/empty (a shape malformed PSI can
+  produce), preventing trailing-dot dotted names from passing the
+  `indexOf('.') >= 0` filter and creating false-positive
+  `startsWith` matches in `UsageStrategy`'s tier-3.
+- **`Map.copyOf` order preservation.** The registry's defensive copy
+  now uses `Collections.unmodifiableMap(new LinkedHashMap<>(...))`
+  to actually keep registration order — the previous
+  `Map.copyOf(LinkedHashMap)` produced a hash-based `MapN` whose
+  iteration order contradicted the surrounding comment.
+- **Schema-too-new rejection test + early-out.** Added
+  `postUpgradeFutureSchemaSnapshotInvalidatesAndForcesFullRescan`
+  to pin the symmetric direction of `tryLoad`'s `!=` schema check
+  (a v=5 future-schema snapshot from a CI matrix downgrade must
+  also be rejected). `Snapshot.read` now short-circuits on a
+  non-current `v\t…` line so `tryLoad` surfaces the canonical
+  "schemaVersion mismatch" log instead of a "failed to read"
+  diagnostic on a future row-shape change. Schema bump rationale
+  in the Javadoc was rewritten to be honest: v=4 is a forward-looking
+  marker bump, not a wire-shape change.
+- **Service-file body-leak prefixes extended.**
+  `ShadowRelocationFunctionalTest`'s body-leak check now mirrors
+  the relocator input set 1:1 — `_COROUTINE.`, `gnu.trove.`,
+  `org.jetbrains.org.`, `org.jetbrains.concurrency.`,
+  `org.jetbrains.annotations.`, `org.intellij.lang.`,
+  `com.intellij.`, plus the broader `kotlinx.` were missing.
+- **`parseKotlinEnabledProperty` test parity.** Mirrored the
+  `parseParallelDiscoveryProperty` alias-set + typo-rejection
+  tests, with the polarity flipped: typos like
+  `affected-tests.kotlin.enabled=tru` fall back to `false` (the
+  safe rollout-window default), not `true`.
+- **Documented MockApplication invariant.** The Javadoc on
+  `KotlinLanguageParser` and the README's known-limitations section
+  now document that `KotlinCoreEnvironment` registers a process-wide
+  static MockApplication on first use; multi-module Gradle builds
+  with `org.gradle.parallel=true` and the rollout flag flipped on
+  collide on that slot. PR #4's flag-flip carries the
+  multi-module-parallel acceptance gate.
+
+The shadow JAR measures **~58.4 MB** (under Plan §5's 60 MB hard
+ceiling); the original 55.7 MB figure cited above grew with the
+kotlin-compiler-embeddable point bumps that landed in flight.
+
 ### Changed — `LanguageParser` dispatch (issue #76, PR #2 of Phase 2)
 
 Refactor only — zero adopter-visible behaviour change for Java diffs.
