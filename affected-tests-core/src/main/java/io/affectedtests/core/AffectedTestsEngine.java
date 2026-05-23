@@ -122,9 +122,14 @@ public final class AffectedTestsEngine {
      * @param ignoredFiles     files matching {@link AffectedTestsConfig#ignorePaths()}
      * @param outOfScopeFiles  files under {@link AffectedTestsConfig#outOfScopeTestDirs()}
      *                         or {@link AffectedTestsConfig#outOfScopeSourceDirs()}
-     * @param productionFiles  {@code .java} files under a configured source dir
-     * @param testFiles        {@code .java} files under a configured test dir
-     * @param unmappedFiles    everything else (yaml, gradle, migrations, stray .java)
+     * @param productionFiles  source files (extensions in
+     *                         {@link io.affectedtests.core.discovery.SourceExtensions#EXTENSIONS} —
+     *                         {@code .java} and {@code .kt} as of PR #1 of issue #76)
+     *                         under a configured source dir
+     * @param testFiles        source files (same extension set as
+     *                         {@code productionFiles}) under a configured test dir
+     * @param unmappedFiles    everything else (yaml, gradle, migrations, stray
+     *                         {@code .java} / {@code .kt})
      */
     public record Buckets(
             Set<String> ignoredFiles,

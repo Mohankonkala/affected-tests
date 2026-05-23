@@ -759,9 +759,14 @@ plugin versions should anchor on the stable prefix / suffix
 Strings without placeholders (PR #1's two lines; PR #4's
 `{ext}`-only line up to the first placeholder) are stable verbatim.
 
-### PR #1 — `issue-76-kotlin-path-derived-mapping`
+### PR #1 — `issue-76-kotlin-path-derived-mapping` ✅ shipped
 **Scope:** Path-derived FQN routing for `.kt` (same rule as `.java`,
 via `PathToClassMapper#tryMapToClass`). No parser, no new dependency.
+
+**Status:** Shipped. Implemented as documented below. Adopter-visible
+behaviour change is the new `Kotlin source mapped via filename only`
+hint in `--explain` plus the bucket-label rename
+(`production .java` → `production`, `test .java` → `test`).
 
 - Widen the `.java`-only suffix-strip in **all** of:
   `PathToClassMapper#tryMapToClass`,

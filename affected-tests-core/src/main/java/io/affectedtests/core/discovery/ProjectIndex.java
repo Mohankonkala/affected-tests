@@ -360,9 +360,41 @@ public final class ProjectIndex {
      * the same primitive ensures the parse-failure count is
      * incremented at most once per failing file no matter how many
      * threads race to ask for it.
+     *
+     * <p>Returns {@code null} for {@code .kt} files in PR #1 of issue
+     * #76 without incrementing {@link #parseFailureCount} — Kotlin
+     * files are genuinely unparsed-by-design until PR #3 lands the
+     * Kotlin parser, and counting them as parse failures would
+     * trigger {@code DISCOVERY_INCOMPLETE} on every diff that touches
+     * a Kotlin file. PR #2 will replace the fixed JavaParser
+     * dispatch with a {@code LanguageParser} interface that
+     * dispatches by extension; PR #3 plugs in
+     * {@code KotlinLanguageParser}. See {@code docs/PHASE-2-KOTLIN-AST.md}
+     * §2-3.
      */
     public CompilationUnit compilationUnit(Path file) {
         Optional<CompilationUnit> entry = cuCache.computeIfAbsent(file, key -> {
+            String ext = SourceExtensions.extensionOf(key.toString());
+            if (!".java".equals(ext)) {
+                // TODO(#76, PR #2): replace this short-circuit with
+                // LanguageParser.parse(file) dispatch. PR #1 of
+                // issue #76 ships path-derived Kotlin mapping only;
+                // PR #2 introduces the LanguageParser interface and
+                // PR #3 plugs in KotlinLanguageParser. This branch
+                // exists so .kt files do not accidentally count
+                // against parseFailureCount (which would surface as
+                // DISCOVERY_INCOMPLETE on every Kotlin diff). The
+                // marker is grep-able so a `git grep TODO(#76`
+                // lists every PR #2 hand-off site.
+                //
+                // Non-Java source recognised by SourceExtensions
+                // (i.e. .kt today): no parser available in PR #1.
+                // Distinct from a JavaParser failure on malformed
+                // .java — do not bump parseFailureCount here, or
+                // every Kotlin diff would surface as
+                // DISCOVERY_INCOMPLETE.
+                return Optional.empty();
+            }
             CompilationUnit cu = JavaParsers.parseOrWarn(PARSER.get(), key, "index");
             if (cu == null) {
                 parseFailureCount.incrementAndGet();

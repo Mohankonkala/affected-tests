@@ -1,6 +1,7 @@
 package io.affectedtests.core.mapping;
 
 import io.affectedtests.core.config.AffectedTestsConfig;
+import io.affectedtests.core.discovery.SourceExtensions;
 import io.affectedtests.core.util.LogSanitizer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -164,8 +165,8 @@ public final class PathToClassMapper {
                 continue;
             }
 
-            if (!filePath.endsWith(".java")) {
-                log.debug("Non-Java file flagged as unmapped: {}", LogSanitizer.sanitize(filePath));
+            if (!SourceExtensions.isSource(filePath)) {
+                log.debug("Non-source file flagged as unmapped: {}", LogSanitizer.sanitize(filePath));
                 unmappedChangedFiles.add(filePath);
                 continue;
             }
@@ -182,6 +183,13 @@ public final class PathToClassMapper {
             // module-info change alters JPMS visibility — so route
             // them to the unmapped bucket and let the UNMAPPED_FILE
             // safety net decide (FULL_SUITE in CI mode by default).
+            //
+            // Kotlin equivalents: there is no Kotlin module-info; the
+            // Kotlin convention for package-level annotations is the
+            // top-of-file `@file:` block on a normal `.kt` file, so we
+            // do not need a `package-info.kt` carve-out — the file's
+            // path-derived FQN is meaningful even when the body is
+            // pure annotations.
             String fileName = extractFileName(filePath);
             if ("module-info.java".equals(fileName) || "package-info.java".equals(fileName)) {
                 log.debug("Java marker file ({}) flagged as unmapped: {}",
@@ -193,6 +201,15 @@ public final class PathToClassMapper {
 
             String testFqn = tryMapToClass(filePath, config.testDirs());
             if (testFqn != null) {
+                // Test files: emit only the path-derived FQN. The
+                // synthetic `<basename>Kt` shape is production-only
+                // (top-level functions get compiled to a class
+                // named `<basename>Kt`); test classes are
+                // conventionally instantiable types, so emitting
+                // `FooTestKt` here would surface to the runner as
+                // "no tests found for class FooTestKt" — the exact
+                // silent-skip behaviour Phase 1 was written to
+                // avoid. See docs/PHASE-2-KOTLIN-AST.md §6.
                 testClasses.add(testFqn);
                 changedTestFiles.add(filePath);
                 log.debug("Mapped test file: {} → {}",
@@ -208,12 +225,43 @@ public final class PathToClassMapper {
                 log.debug("Mapped production file: {} → {}",
                         LogSanitizer.sanitize(filePath),
                         LogSanitizer.sanitize(prodFqn));
+                // Phase 2 PR #1 (issue #76): for production .kt files
+                // emit a second synthetic FQN ending in `Kt` to match
+                // the compiled-class shape Kotlin uses for top-level
+                // functions and properties (file `Util.kt` with no
+                // explicit class declaration compiles to class
+                // `UtilKt`). Tests written against the top-level
+                // functions therefore import `UtilKt`, not `Util`,
+                // and the existing simple-name probes
+                // (NamingConventionStrategy looking for `UtilKtTest`,
+                // UsageStrategy tier-1 matching `import …UtilKt;`)
+                // need the synthetic FQN in `productionClasses` to
+                // fire. Bounded over-selection: a `.kt` that contains
+                // an explicit class declaration adds one extra
+                // simple-name probe (e.g. `Util` and `UtilKt`); the
+                // probe drops out automatically when no test matches.
+                // Edge case: `FormatKt.kt` with `class FormatKt`
+                // produces the phantom `FormatKtKt` synthetic — the
+                // Kotlin compiler never emits a class with that
+                // name, no real import or supertype edge references
+                // it, so the over-selection bound stays at one
+                // naming probe per file.
+                if (".kt".equals(SourceExtensions.extensionOf(filePath))) {
+                    String synthetic = prodFqn + "Kt";
+                    if (productionClasses.add(synthetic)) {
+                        log.debug("Synthetic Kotlin top-level FQN: {} → {}",
+                                LogSanitizer.sanitize(filePath),
+                                LogSanitizer.sanitize(synthetic));
+                    }
+                }
                 continue;
             }
 
-            // A .java file outside the configured source/test dirs — still
-            // unmappable, still a potential safety escalation trigger.
-            log.debug("Java file outside configured source/test dirs flagged as unmapped: {}",
+            // A source file outside the configured source/test dirs —
+            // still unmappable, still a potential safety-net escalation
+            // trigger. Pre-PR-1 this branch only fired for stray
+            // .java files; .kt files now reach it on the same terms.
+            log.debug("Source file outside configured source/test dirs flagged as unmapped: {}",
                     LogSanitizer.sanitize(filePath));
             unmappedChangedFiles.add(filePath);
         }
@@ -263,9 +311,7 @@ public final class PathToClassMapper {
             }
 
             String relativePath = normalized.substring(idx + normalizedDir.length());
-            if (relativePath.endsWith(".java")) {
-                relativePath = relativePath.substring(0, relativePath.length() - 5);
-            }
+            relativePath = SourceExtensions.stripKnownExtension(relativePath);
             return relativePath.replace('/', '.');
         }
         return null;

@@ -183,9 +183,11 @@ class ProjectIndexCacheStage2Test {
         // The contract: a build that never touches the metadata cache
         // (e.g. a no-op rebuild for a test-only diff that never reaches
         // Usage / Implementation / Transitive) must still persist a
-        // valid v2 snapshot — otherwise the next run takes the
-        // schema-mismatch invalidation path forever and the cache
-        // never warms up.
+        // valid snapshot at the current schema version — otherwise
+        // the next run takes the schema-mismatch invalidation path
+        // forever and the cache never warms up. PR #1 of issue #76
+        // bumped the schema 2 → 3 to invalidate stale Java-only
+        // testFqn universes on mixed Java + Kotlin projects.
         writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
                 "package com.example; public class FooTest {}");
 
@@ -196,8 +198,8 @@ class ProjectIndexCacheStage2Test {
         Path snapshot = projectDir.resolve("build/affected-tests/index/v1/snapshot.tsv");
         assertTrue(Files.isRegularFile(snapshot));
         String contents = Files.readString(snapshot);
-        assertTrue(contents.contains("v\t2"),
-                "Persisted snapshot must declare schema version 2");
+        assertTrue(contents.contains("v\t3"),
+                "Persisted snapshot must declare current schema version (3 since PR #1 of issue #76)");
 
         ProjectIndex second = ProjectIndex.build(projectDir, BASE_CONFIG);
         assertEquals(first.testFqns(), second.testFqns(),

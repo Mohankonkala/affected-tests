@@ -141,6 +141,51 @@ class ProjectIndexTest {
                 "Repeated compilationUnit() calls on the same file must not inflate the count");
     }
 
+    @Test
+    void compilationUnitReturnsNullForKotlinWithoutBumpingParseFailureCount() throws Exception {
+        // PR #1 of issue #76 contract: Kotlin files are
+        // genuinely unparsed-by-design until PR #3 lands the
+        // KotlinLanguageParser. They must NOT count against
+        // parseFailureCount — that counter drives
+        // DISCOVERY_INCOMPLETE escalation, and treating every
+        // .kt file as a parse failure would surface
+        // DISCOVERY_INCOMPLETE on every Kotlin diff (the exact
+        // failure mode PR #1's short-circuit in
+        // ProjectIndex.compilationUnit was added to prevent).
+        Path kotlin = projectDir.resolve("src/main/java/com/example/Util.kt");
+        Files.createDirectories(kotlin.getParent());
+        Files.writeString(kotlin,
+                "package com.example\nfun greet(name: String) = \"hi $name\"");
+
+        AffectedTestsConfig config = AffectedTestsConfig.builder().mode(Mode.CI).build();
+        ProjectIndex index = ProjectIndex.build(projectDir, config);
+
+        assertNull(index.compilationUnit(kotlin),
+                "Kotlin file must yield null (no JavaParser CU) until PR #3 "
+                        + "of issue #76 plugs in the Kotlin language parser");
+        assertEquals(0, index.parseFailureCount(),
+                "A .kt file must NOT increment parseFailureCount — treating "
+                        + "it as a parse failure would surface DISCOVERY_INCOMPLETE "
+                        + "on every Kotlin diff. Got: " + index.parseFailureCount());
+
+        // Idempotency: repeated lookups on the same .kt file
+        // must continue to yield null and never start counting
+        // (regression-proofing against a future change that
+        // dropped the short-circuit but kept the cache).
+        index.compilationUnit(kotlin);
+        index.compilationUnit(kotlin);
+        assertEquals(0, index.parseFailureCount());
+
+        // fileMetadata follows the same contract: null for .kt,
+        // and strategies skip on null. UsageStrategy /
+        // ImplementationStrategy / TransitiveStrategy index-driven
+        // paths therefore return zero matches for Kotlin until
+        // PR #3 — exactly what docs/PHASE-2-KOTLIN-AST.md §9 PR #1
+        // promises.
+        assertNull(index.fileMetadata(kotlin),
+                "fileMetadata(.kt) must follow compilationUnit's null contract");
+    }
+
     private static void writeJava(Path target, String body) throws Exception {
         Files.createDirectories(target.getParent());
         Files.writeString(target, body);

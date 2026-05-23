@@ -216,6 +216,48 @@ class ProjectIndexCacheTest {
     }
 
     @Test
+    void prePhase2SchemaSnapshotInvalidatesAndForcesFullRescan() throws Exception {
+        // Phase 2 PR #1 of issue #76: bumped SCHEMA_VERSION 2 → 3
+        // because configHash() does not include the file-extension
+        // scope the scanner walks; on a mixed Java + Kotlin project,
+        // a pre-PR-1 snapshot's testFqn universe is missing every
+        // Kotlin test FQN, but the configHash is identical pre/post
+        // upgrade.
+        //
+        // The schema bump is the only mechanism that guarantees a
+        // clean rescan on warm caches across the upgrade boundary.
+        // Verify by hand-writing a v=2 snapshot whose contents
+        // claim a stale view of the project, then assert the new
+        // build invalidates it and produces fresh data.
+        writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
+                "package com.example; public class FooTest {}");
+        Files.createDirectories(projectDir.resolve("src/test/java/com/example"));
+        Files.writeString(projectDir.resolve("src/test/java/com/example/BarTest.kt"),
+                "package com.example\nclass BarTest");
+
+        Path cacheDir = projectDir.resolve("build/affected-tests/index/v1");
+        Files.createDirectories(cacheDir);
+        // Hand-rolled v=2 snapshot. The contents are deliberately
+        // wrong (no test FQN entries) — the schemaVersion check is
+        // the load-bearing rejection signal we want to assert. If
+        // the schema check were permissive, the build would adopt
+        // these stale contents and downstream strategies would
+        // silently under-select.
+        Files.writeString(cacheDir.resolve("snapshot.tsv"),
+                "v\t2\ncfg\twillbeoverwritten\n");
+
+        ProjectIndex index = ProjectIndex.build(projectDir, BASE_CONFIG);
+
+        assertTrue(index.testFqns().contains("com.example.FooTest"),
+                "Java test FQN must surface from the rescan even when a "
+                        + "stale v=2 snapshot exists. Got: " + index.testFqns());
+        assertTrue(index.testFqns().contains("com.example.BarTest"),
+                "Kotlin test FQN must surface from the rescan — this is "
+                        + "the exact case the schema bump exists to catch on "
+                        + "the upgrade boundary. Got: " + index.testFqns());
+    }
+
+    @Test
     void disableViaSystemPropertyBypassesCache() throws Exception {
         writeJava(projectDir.resolve("src/test/java/com/example/FooTest.java"),
                 "package com.example; public class FooTest {}");
