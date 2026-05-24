@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — Phase 3 Groovy AST tech plan (issue #96 / #47)
+
+`docs/PHASE-3-GROOVY-AST.md` lays out the plan for making Groovy a
+first-class source language in the discovery engine, building on the
+Phase 2 architecture: widen `SourceExtensions.EXTENSIONS` for `.groovy` /
+`.gvy`, extend `SourceSetAutoDiscovery` to walk Groovy sourcesets via
+`ss.getExtensions().findByType(GroovySourceDirectorySet.class)` so
+Spock specs under `src/test/groovy` enter the test universe without
+manual DSL config, ship `GroovyLanguageParser` against Apache Groovy
+5.0.6's `CompilationUnit.compile(Phases.CONVERSION)` (committed over
+`AstBuilder` on operational lifecycle grounds — shared
+`GroovyClassLoader` parity with Phase 2's Kotlin parser shape — with
+a small `GroovySupertypeResolver` helper for simple-name supertype
+resolution at the `CONVERSION` phase), shade `org.apache.groovy.*` +
+`org.codehaus.groovy.*` + bundled antlr4 / asm / picocli copies under
+`io.affectedtests.shadow.{apache,codehaus,}groovy.*`, and add `Spec`
+/ `Specification` to the default test-suffix list so Spock specs are
+picked up by the naming strategy out of the box. Diagnostics ship as
+a parallel `GroovyDiagnostics` carrier (sibling of `KotlinDiagnostics`,
+no rename of the existing carrier so Phase 2's public API stays
+intact); `LanguageParser` gains two default-method hooks
+(`recordDiagnostics`, `replayWarmCacheDiagnostics`) so `ProjectIndex`
+no longer needs `instanceof` branches per parser class. Three-PR
+rollout (the `LanguageParser` interface already exists from Phase 2)
+with explicit maintainer-driven decision pauses — Phase 3 may stop
+after PR #1 if the maintainer's internal Spock fixture audit shows
+approach A (filename-only + Spock suffixes + sourceset auto-discovery)
+closes enough of the gap. Plan-only — no engine code changes in this
+entry.
+
 ### Changed — Kotlin AST default-on, system property removed (issue #76, PR #4 of Phase 2)
 
 Closes the Phase 2 rollout. `kotlinEnabled` flips to **default `true`**:
