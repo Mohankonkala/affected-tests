@@ -18,10 +18,11 @@ import java.util.Set;
  * list in one place so a future Groovy / Scala extension can be added
  * with a single edit.
  *
- * <p>Phase 2 of issue #76 ships path-derived FQN mapping for
- * {@code .kt} (PR #1) and full Kotlin AST parsing
- * (PR #3, gated on {@code -Daffected-tests.kotlin.enabled=true} until
- * PR #4). See {@code docs/PHASE-2-KOTLIN-AST.md}.
+ * <p>Phase 2 of issue #76 shipped path-derived FQN mapping for
+ * {@code .kt} (PR #1) and full Kotlin AST parsing (PR #3, then
+ * default-on with the system-property gate removed in PR #4 — the
+ * DSL flag {@code affectedTests { kotlinEnabled = false }} is the
+ * remaining escape hatch). See {@code docs/PHASE-2-KOTLIN-AST.md}.
  */
 public final class SourceExtensions {
 

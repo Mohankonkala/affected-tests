@@ -205,6 +205,19 @@ public final class AffectedTestsEngine {
      *                                 on engine paths that don't run
      *                                 discovery (test-only fast path,
      *                                 EMPTY_DIFF, etc.).
+     * @param kotlinDiagnostics        per-engine carrier for the four
+     *                                 Kotlin AST signals plumbed into
+     *                                 {@code --explain}: AST-mapped
+     *                                 FQN samples, parse-failure count,
+     *                                 path-vs-package mismatch samples,
+     *                                 and embeddable-bootstrap-failure
+     *                                 cause. Issue #76 PR #4. Defaults
+     *                                 to {@link KotlinDiagnostics#EMPTY}
+     *                                 when the engine ran without
+     *                                 Kotlin participation (Kotlin flag
+     *                                 off, fast paths, etc.) so the
+     *                                 renderer can poll without a null
+     *                                 branch.
      */
     public record AffectedTestsResult(
             Set<String> testClassFqns,
@@ -219,7 +232,8 @@ public final class AffectedTestsEngine {
             Action action,
             EscalationReason escalationReason,
             Map<String, Set<String>> namingCrossPackageMatches,
-            DiscoveryProfile discoveryProfile
+            DiscoveryProfile discoveryProfile,
+            KotlinDiagnostics kotlinDiagnostics
     ) {
         public AffectedTestsResult {
             namingCrossPackageMatches = namingCrossPackageMatches == null
@@ -228,6 +242,38 @@ public final class AffectedTestsEngine {
             discoveryProfile = discoveryProfile == null
                     ? DiscoveryProfile.empty()
                     : discoveryProfile;
+            kotlinDiagnostics = kotlinDiagnostics == null
+                    ? KotlinDiagnostics.EMPTY
+                    : kotlinDiagnostics;
+        }
+
+        /**
+         * Backwards-compatible 13-arg constructor — preserves the
+         * pre-issue-#76-PR-4 record shape. Defaults
+         * {@code kotlinDiagnostics} to {@link KotlinDiagnostics#EMPTY},
+         * matching every engine path that did not run Kotlin AST
+         * participation.
+         */
+        public AffectedTestsResult(
+                Set<String> testClassFqns,
+                Map<String, Path> testFqnToPath,
+                Set<String> changedFiles,
+                Set<String> changedProductionClasses,
+                Set<String> changedTestClasses,
+                Buckets buckets,
+                boolean runAll,
+                boolean skipped,
+                Situation situation,
+                Action action,
+                EscalationReason escalationReason,
+                Map<String, Set<String>> namingCrossPackageMatches,
+                DiscoveryProfile discoveryProfile
+        ) {
+            this(testClassFqns, testFqnToPath, changedFiles,
+                    changedProductionClasses, changedTestClasses,
+                    buckets, runAll, skipped, situation, action,
+                    escalationReason, namingCrossPackageMatches,
+                    discoveryProfile, KotlinDiagnostics.EMPTY);
         }
 
         /**
@@ -256,14 +302,15 @@ public final class AffectedTestsEngine {
                     changedProductionClasses, changedTestClasses,
                     buckets, runAll, skipped, situation, action,
                     escalationReason, namingCrossPackageMatches,
-                    DiscoveryProfile.empty());
+                    DiscoveryProfile.empty(), KotlinDiagnostics.EMPTY);
         }
 
         /**
          * Backwards-compatible 11-arg constructor — preserves the
          * pre-issue-#40 record shape. Defaults
-         * {@code namingCrossPackageMatches} to {@link Map#of()} and
-         * {@code discoveryProfile} to {@link DiscoveryProfile#empty()}.
+         * {@code namingCrossPackageMatches} to {@link Map#of()},
+         * {@code discoveryProfile} to {@link DiscoveryProfile#empty()},
+         * and {@code kotlinDiagnostics} to {@link KotlinDiagnostics#EMPTY}.
          */
         public AffectedTestsResult(
                 Set<String> testClassFqns,
@@ -281,7 +328,8 @@ public final class AffectedTestsEngine {
             this(testClassFqns, testFqnToPath, changedFiles,
                     changedProductionClasses, changedTestClasses,
                     buckets, runAll, skipped, situation, action,
-                    escalationReason, Map.of(), DiscoveryProfile.empty());
+                    escalationReason, Map.of(),
+                    DiscoveryProfile.empty(), KotlinDiagnostics.EMPTY);
         }
     }
 
@@ -510,7 +558,8 @@ public final class AffectedTestsEngine {
                     parseFailures, action);
             if (action == Action.FULL_SUITE || action == Action.SKIPPED) {
                 return emptyResult(Situation.DISCOVERY_INCOMPLETE, action, changedFiles,
-                        mapping.productionClasses(), mapping.testClasses(), buckets);
+                        mapping.productionClasses(), mapping.testClasses(), buckets,
+                        index.kotlinDiagnostics());
             }
             // SELECTED: honour the situation but fall through to the
             // shared empty/selected tail below. The tail now picks the
@@ -538,7 +587,8 @@ public final class AffectedTestsEngine {
             log.info("Discovery produced no affected tests. Situation: {}, Action: {}.",
                     emptySituation, action);
             return emptyResult(emptySituation, action, changedFiles,
-                    mapping.productionClasses(), mapping.testClasses(), buckets);
+                    mapping.productionClasses(), mapping.testClasses(), buckets,
+                    index.kotlinDiagnostics());
         }
 
         log.info("=== Result: {} affected test classes ({}) ===",
@@ -571,7 +621,8 @@ public final class AffectedTestsEngine {
                 Action.SELECTED,
                 EscalationReason.NONE,
                 survivingCrossPackage,
-                profile
+                profile,
+                index.kotlinDiagnostics()
         );
         }
     }
@@ -703,6 +754,32 @@ public final class AffectedTestsEngine {
                                             Set<String> changedProduction,
                                             Set<String> changedTests,
                                             Buckets buckets) {
+        return emptyResult(situation, action, changedFiles,
+                changedProduction, changedTests, buckets,
+                KotlinDiagnostics.EMPTY);
+    }
+
+    /**
+     * Overload threaded through the engine's {@code try (ProjectIndex
+     * index = ...)} block so the Kotlin diagnostics captured during
+     * discovery survive into {@code DISCOVERY_INCOMPLETE} /
+     * {@code DISCOVERY_EMPTY} returns. Without this overload the
+     * pre-existing 11-arg {@link AffectedTestsResult} constructor
+     * defaults the diagnostics to {@link KotlinDiagnostics#EMPTY}
+     * and the four pinned --explain strings would silently drop on
+     * every parse-failure / empty-discovery run — exactly the
+     * situations adopters most need them on. The
+     * outside-the-index callers (EMPTY_DIFF, ALL_FILES_IGNORED,
+     * etc.) keep the no-arg overload and pass {@link
+     * KotlinDiagnostics#EMPTY} because no parser ran in those
+     * branches.
+     */
+    private AffectedTestsResult emptyResult(Situation situation, Action action,
+                                            Set<String> changedFiles,
+                                            Set<String> changedProduction,
+                                            Set<String> changedTests,
+                                            Buckets buckets,
+                                            KotlinDiagnostics kotlinDiagnostics) {
         boolean runAll = action == Action.FULL_SUITE;
         // SELECTED on an ambiguous branch is treated as "skipped" for the
         // Gradle task's wiring — there is nothing to dispatch either way —
@@ -722,7 +799,9 @@ public final class AffectedTestsEngine {
                 situation,
                 action,
                 escalationReason(situation, action),
-                Map.of()
+                Map.of(),
+                DiscoveryProfile.empty(),
+                kotlinDiagnostics == null ? KotlinDiagnostics.EMPTY : kotlinDiagnostics
         );
     }
 

@@ -193,10 +193,29 @@ public final class ProjectIndex implements AutoCloseable {
      */
     private final LanguageParsers languageParsers;
 
+    /**
+     * Source-dir suffixes (e.g. {@code ["src/main/java"]}) used to
+     * derive the path-based FQN for {@code .kt} files in
+     * {@link #fileMetadata(Path)}. Held here rather than re-passed
+     * through every callsite because the dirs are immutable for the
+     * life of the index, and the path-vs-package mismatch detection
+     * needs both the file's parsed package and its
+     * {@link SourceFileScanner#pathToFqn(Path, List)}-derived
+     * package on every Kotlin parse. Empty list when the index was
+     * built via the legacy no-config path (tests that probe the
+     * registry directly), in which case the mismatch detection
+     * becomes a no-op — the test-only constructor users never
+     * surface --explain output.
+     */
+    private final List<String> sourceDirsForMismatch;
+    private final List<String> testDirsForMismatch;
+
     private ProjectIndex(List<Path> sourceFiles, List<Path> testFiles,
                          Map<String, Path> testFqnToPath, Set<String> sourceFqns,
                          ProjectIndexCache.ScannedDirs scannedDirs,
-                         LanguageParsers languageParsers) {
+                         LanguageParsers languageParsers,
+                         List<String> sourceDirsForMismatch,
+                         List<String> testDirsForMismatch) {
         this.sourceFiles = sourceFiles;
         this.testFiles = testFiles;
         this.testFqnToPath = testFqnToPath;
@@ -213,6 +232,12 @@ public final class ProjectIndex implements AutoCloseable {
         this.languageParsers = languageParsers != null
                 ? languageParsers
                 : LanguageParsers.defaultJavaOnly();
+        this.sourceDirsForMismatch = sourceDirsForMismatch == null
+                ? List.of()
+                : List.copyOf(sourceDirsForMismatch);
+        this.testDirsForMismatch = testDirsForMismatch == null
+                ? List.of()
+                : List.copyOf(testDirsForMismatch);
     }
 
     public static ProjectIndex build(Path projectDir, AffectedTestsConfig config) {
@@ -299,7 +324,9 @@ public final class ProjectIndex implements AutoCloseable {
                 Collections.unmodifiableMap(testFqnToPath),
                 Collections.unmodifiableSet(sourceFqns),
                 dirs,
-                LanguageParsers.forConfig(config)
+                LanguageParsers.forConfig(config),
+                config.sourceDirs(),
+                config.testDirs()
         );
 
         if (Boolean.parseBoolean(System.getProperty("affected-tests.indexCache.enabled", "true"))) {
@@ -335,7 +362,9 @@ public final class ProjectIndex implements AutoCloseable {
                 Collections.unmodifiableMap(testFqnToPath),
                 Collections.unmodifiableSet(sourceFqns),
                 scannedDirs,
-                LanguageParsers.forConfig(config)
+                LanguageParsers.forConfig(config),
+                config.sourceDirs(),
+                config.testDirs()
         );
     }
 
@@ -526,7 +555,55 @@ public final class ProjectIndex implements AutoCloseable {
                 md = parser.parseOrWarn(key, "index");
                 if (md == null) {
                     parseFailureCount.incrementAndGet();
+                    // Surface non-Java parse failures into the
+                    // language-specific diagnostics carrier too.
+                    // Currently only Kotlin participates; future
+                    // languages will get their own carriers but
+                    // share the same per-engine pattern.
+                    //
+                    // Issue #76 PR #4 — review fix: suppress the
+                    // {@code recordParseFailure} bump when the
+                    // embeddable bootstrap already failed for this
+                    // run. A bootstrap failure makes every subsequent
+                    // {@code parseOrWarn(.kt, ...)} short-circuit
+                    // returning {@code null} — those nulls are
+                    // propagation of the same root cause, NOT
+                    // independent per-file parse failures. Without
+                    // this guard a 50-file Kotlin module would
+                    // surface a misleading
+                    // {@code "Kotlin file failed to parse with
+                    // embeddable 2.1.20; counted into
+                    // DISCOVERY_INCOMPLETE."} hint alongside the
+                    // accurate
+                    // {@code "Kotlin embeddable failed to load: ..."}
+                    // hint, suggesting 50 independent parse failures
+                    // when there are zero. The general
+                    // {@code parseFailureCount} bump still fires so
+                    // {@link io.affectedtests.core.config.Situation#DISCOVERY_INCOMPLETE}
+                    // routing keeps its canonical signal — only the
+                    // duplicate Kotlin-specific count is gated.
+                    if (parser instanceof KotlinLanguageParser) {
+                        KotlinDiagnostics diag = languageParsers.kotlinDiagnostics();
+                        if (diag.embeddableLoadFailureCause() == null) {
+                            diag.recordParseFailure();
+                        }
+                    }
                     return Optional.empty();
+                }
+                // Path-vs-package mismatch detection (issue #76 PR #4
+                // — one of the four pinned --explain strings).
+                // Compare the parsed package against the package the
+                // diff-side mapper would derive from the file's
+                // directory layout. A divergence means
+                // {@link io.affectedtests.core.mapping.PathToClassMapper}
+                // routes the file under one FQN while AST-driven
+                // strategies harvest its declarations under another;
+                // adopters need to see this in --explain so they can
+                // either reorganise the file (the cheap fix) or
+                // expect the naming strategy to under-select on this
+                // file (the documented behaviour).
+                if (parser instanceof KotlinLanguageParser) {
+                    recordPathPackageMismatchIfAny(key, md.packageName());
                 }
             }
             // Capture the source file's (mtime, size) fingerprint
@@ -574,6 +651,28 @@ public final class ProjectIndex implements AutoCloseable {
      */
     void seedFileMetadata(Path file, FileMetadata metadata, long mtime, long size) {
         metadataCache.put(file, Optional.of(new CachedMetadata(metadata, mtime, size)));
+        // Warm-cache --explain parity (issue #76 PR #4): the cold-cache
+        // {@link KotlinLanguageParser#extractMetadata} call site
+        // records the AST-mapped FQN + path/package mismatch on the
+        // diagnostics carrier as the file flows through. The seed
+        // path bypasses the parser by design (zero-cost reuse on
+        // unchanged files), so without re-emitting the same signals
+        // here a warm-cache run would silently lose the
+        // {@code Kotlin source AST-mapped to FQN ...} hint and the
+        // path/package mismatch hint — the renderer would then fall
+        // through to the "filename only" PR #1 wording, which is
+        // misleading because AST DID participate (on the cold run
+        // that populated the cache).
+        //
+        // Only Kotlin files participate; the {@code .java} branch
+        // has its own --explain machinery and never produced these
+        // four pinned strings.
+        if (".kt".equals(SourceExtensions.extensionOf(file.toString()))) {
+            KotlinDiagnostics diag = languageParsers.kotlinDiagnostics();
+            diag.recordAstMapped(
+                    KotlinDiagnostics.joinFqn(metadata.packageName(), metadata.primaryTypeName()));
+            recordPathPackageMismatchIfAny(file, metadata.packageName());
+        }
     }
 
     /**
@@ -632,6 +731,69 @@ public final class ProjectIndex implements AutoCloseable {
      */
     public int parseFailureCount() {
         return parseFailureCount.get();
+    }
+
+    /**
+     * Per-engine Kotlin diagnostics carrier. Populated by
+     * {@link KotlinLanguageParser} and {@link #fileMetadata(Path)}'s
+     * mismatch detection; consumed by
+     * {@link io.affectedtests.core.AffectedTestsEngine} to thread onto
+     * the {@link io.affectedtests.core.AffectedTestsEngine.AffectedTestsResult}
+     * for the four pinned {@code --explain} strings (issue #76 PR #4).
+     * Always non-null; returns {@link KotlinDiagnostics#EMPTY} when
+     * Kotlin participation is off, so the renderer can poll without
+     * a null branch.
+     */
+    public KotlinDiagnostics kotlinDiagnostics() {
+        return languageParsers.kotlinDiagnostics();
+    }
+
+    /**
+     * Compares {@code parsedPackage} against the package
+     * {@link SourceFileScanner#pathToFqn(Path, List)} would derive
+     * from {@code file}'s directory layout. On divergence, records
+     * the mismatch into {@link KotlinDiagnostics} so the {@code
+     * --explain} renderer can pin the {@code Kotlin file {path}
+     * declares package {parsed} but path-derives to {path-derived}}
+     * line.
+     *
+     * <p>Both source and test dirs are tried because Kotlin
+     * production and test files share the parser path; the first
+     * matching dir wins. When no dir matches (the file lives
+     * outside any configured root, e.g. a stray top-level {@code
+     * .kt}) the path-derived FQN is undefined and we suppress the
+     * mismatch line — the file would have been routed to the
+     * unmapped bucket anyway.
+     *
+     * <p>Path-derived package = path-derived FQN minus the simple
+     * name. Compared verbatim (case-sensitive); Kotlin packages are
+     * case-sensitive on disk and in the language. The trailing
+     * "default package" case (file declares no package and lives
+     * directly under a source root) compares two empty strings —
+     * not a mismatch.
+     */
+    private void recordPathPackageMismatchIfAny(Path file, String parsedPackage) {
+        if (sourceDirsForMismatch.isEmpty() && testDirsForMismatch.isEmpty()) {
+            return;
+        }
+        String pathDerivedFqn = SourceFileScanner.pathToFqn(file, sourceDirsForMismatch);
+        if (pathDerivedFqn == null) {
+            pathDerivedFqn = SourceFileScanner.pathToFqn(file, testDirsForMismatch);
+        }
+        if (pathDerivedFqn == null) {
+            // File outside any configured source / test root —
+            // unmapped-bucket case, no path-derived FQN to compare
+            // against. The mismatch line would point at a phantom
+            // adopter expectation; suppress it.
+            return;
+        }
+        int lastDot = pathDerivedFqn.lastIndexOf('.');
+        String pathDerivedPackage = lastDot < 0 ? "" : pathDerivedFqn.substring(0, lastDot);
+        String parsed = parsedPackage == null ? "" : parsedPackage;
+        if (!parsed.equals(pathDerivedPackage)) {
+            languageParsers.kotlinDiagnostics()
+                    .recordPathPackageMismatch(file, parsed, pathDerivedPackage);
+        }
     }
 
     /**

@@ -21,8 +21,11 @@ import java.nio.file.Path;
  * hack via a grep-able PR #1 marker. PR #2 introduces this
  * interface, registers a {@link JavaLanguageParser}, and routes every
  * parser-side site through {@link LanguageParsers#forFile} dispatch.
- * PR #3 plugs in {@code KotlinLanguageParser}; PR #4 flips the
- * {@code affected-tests.kotlin.enabled} flag default.
+ * PR #3 plugged in {@code KotlinLanguageParser} behind a system-property
+ * gate. PR #4 dropped the gate, made {@code kotlinEnabled} default-on
+ * via the DSL, and removed the {@code -Daffected-tests.kotlin.enabled}
+ * system property entirely — Kotlin AST participation is now
+ * first-class, with the DSL flag as the documented escape hatch.
  *
  * <p>Implementations must be thread-safe for parallel discovery
  * (issue #42's posture). The Java implementation owns a

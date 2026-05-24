@@ -133,14 +133,14 @@ public final class ProjectIndexCache {
      * independent of {@code configHash}. The wire format in v=4
      * is byte-compatible with v=3 — the {@code m} row layout did
      * not change in this PR. Cross-flag invalidation (e.g. a CI
-     * worker that flipped {@code -Daffected-tests.kotlin.enabled}
-     * once for a smoke test must not feed a half-Kotlin-shaped
-     * cache to a worker that ran with the property off) is
-     * delegated to the {@code |kotlinEnabled:<bool>} term added
-     * to {@link #configHash(io.affectedtests.core.config.AffectedTestsConfig)}
+     * worker that ran once with {@code kotlinEnabled = true} for
+     * a smoke test must not feed a half-Kotlin-shaped cache to
+     * a worker that ran with the DSL flag off) is delegated to
+     * the {@code |kotlinEnabled:<bool>} term added to
+     * {@link #configHash(io.affectedtests.core.config.AffectedTestsConfig)}
      * in this same PR, which is mathematically sufficient for
      * every flag-flip scenario. The schema bump itself is a
-     * forward-looking defensive marker: PR #4's flag-flip plus
+     * forward-looking defensive marker: PR #4's default-flip plus
      * any future shape change to {@code m} rows (e.g. honouring
      * {@code @file:JvmName}, adding sealed-hierarchy supertype
      * lists) will piggyback on a v=5 bump rather than rely on
@@ -534,13 +534,16 @@ public final class ProjectIndexCache {
         appendList(sb, config.outOfScopeTestDirs());
         // Issue #76 PR #3 — Kotlin AST gate participates in the hash so
         // a flip across consecutive runs forces a full rescan. Without
-        // this, a worker that ran once with -Daffected-tests.kotlin.enabled=true
-        // and persisted Kotlin {@code m} rows would have its cache reused
-        // by a subsequent worker running with the flag off — the off-mode
-        // strategies would then consume Kotlin FileMetadata they were not
-        // configured to expect. The schema bump (v3 → v4) catches the
-        // row-shape change across the PR boundary; this hash term catches
-        // the same-binary, same-cache, different-flag-value case.
+        // this, a worker that ran once with the DSL flag {@code
+        // kotlinEnabled = true} and persisted Kotlin {@code m} rows
+        // would have its cache reused by a subsequent worker running
+        // with the flag off — the off-mode strategies would then
+        // consume Kotlin FileMetadata they were not configured to
+        // expect. The schema bump (v3 → v4) catches the row-shape
+        // change across the PR boundary; this hash term catches the
+        // same-binary, same-cache, different-flag-value case. (PR #4
+        // dropped the {@code -Daffected-tests.kotlin.enabled} system
+        // property, but the DSL flag still flips the cache shape.)
         sb.append("|kotlinEnabled:").append(config.kotlinEnabled());
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");

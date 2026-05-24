@@ -143,21 +143,32 @@ class ProjectIndexTest {
 
     @Test
     void compilationUnitReturnsNullForKotlinWithoutBumpingParseFailureCount() throws Exception {
-        // PR #1 of issue #76 contract: Kotlin files are
-        // genuinely unparsed-by-design until PR #3 lands the
-        // KotlinLanguageParser. They must NOT count against
-        // parseFailureCount — that counter drives
-        // DISCOVERY_INCOMPLETE escalation, and treating every
-        // .kt file as a parse failure would surface
-        // DISCOVERY_INCOMPLETE on every Kotlin diff (the exact
-        // failure mode PR #1's short-circuit in
-        // ProjectIndex.compilationUnit was added to prevent).
+        // PR #4-era contract for the {@code kotlinEnabled = false}
+        // escape hatch. Pre-PR-4 the default was {@code false} and
+        // {@code mode(Mode.CI).build()} alone was enough to inherit
+        // the Phase 1 (PR #1) "Kotlin unparsed-by-design" shape.
+        // PR #4 flipped {@code kotlinEnabled} default to {@code true},
+        // so this test now explicitly opts into the escape hatch to
+        // pin the same contract: a {@code .kt} file under that flag
+        // must yield {@code null} from both {@code compilationUnit}
+        // and {@code fileMetadata} and must NOT increment
+        // {@code parseFailureCount} — counting genuinely-unparsed
+        // Kotlin as a parse failure would surface
+        // {@code DISCOVERY_INCOMPLETE} on every Kotlin diff under
+        // the escape hatch (the exact failure mode PR #1's
+        // short-circuit in {@code ProjectIndex.compilationUnit} was
+        // added to prevent, and which the escape hatch must keep
+        // preventing for adopters who flip the flag back to false
+        // after hitting a regression).
         Path kotlin = projectDir.resolve("src/main/java/com/example/Util.kt");
         Files.createDirectories(kotlin.getParent());
         Files.writeString(kotlin,
                 "package com.example\nfun greet(name: String) = \"hi $name\"");
 
-        AffectedTestsConfig config = AffectedTestsConfig.builder().mode(Mode.CI).build();
+        AffectedTestsConfig config = AffectedTestsConfig.builder()
+                .mode(Mode.CI)
+                .kotlinEnabled(false)
+                .build();
         ProjectIndex index = ProjectIndex.build(projectDir, config);
 
         assertNull(index.compilationUnit(kotlin),
