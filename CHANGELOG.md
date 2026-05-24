@@ -6,6 +6,83 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed — Kotlin AST default-on, system property removed (issue #76, PR #4 of Phase 2)
+
+Closes the Phase 2 rollout. `kotlinEnabled` flips to **default `true`**:
+every adopter on the next minor sees `.kt` files participate in
+AST-driven discovery (UsageStrategy direct-import, ImplementationStrategy
+supertype walk, TransitiveStrategy reference graph) on every run with
+zero opt-in. The pre-PR-4 system-property gate
+(`-Daffected-tests.kotlin.enabled`) is **removed** along with its
+property-parser tests — the DSL flag
+(`affectedTests { kotlinEnabled = false }`) is the only remaining knob,
+documented in the README "Known limitations" section as the escape hatch
+for adopters who hit an embeddable bootstrap collision on a multi-module
+parallel Gradle build.
+
+PR #4 also closes the `--explain` plumbing deferred from PR #3. A new
+`KotlinDiagnostics` carrier aggregates per-engine Kotlin metrics
+(AST-mapped FQN samples, parse-failure count, path/package mismatch
+samples, embeddable load-failure cause) and threads through
+`LanguageParsers` → `KotlinLanguageParser` (records on every successful
+extract + every bootstrap failure) → `ProjectIndex` (records mismatches
+in `fileMetadata`'s non-Java branch + parse failures on `parseOrWarn`
+returning `null`) → `AffectedTestsResult` (new `kotlinDiagnostics` field
+with backward-compat constructor overloads defaulting to
+`KotlinDiagnostics.EMPTY` so every existing test fixture and downstream
+caller compiles unchanged) → `AffectedTestTask.renderExplainTrace`. Four
+new pinned `--explain` strings emit:
+
+- `Kotlin source AST-mapped to FQN <fqn>.` — fires per AST-mapped
+  sample (capped at the existing `EXPLAIN_SAMPLE_LIMIT`, with an
+  `… and N more Kotlin source(s) AST-mapped this run.` summary when
+  the cap is hit).
+- `Kotlin file failed to parse with embeddable 2.1.20; counted into
+  DISCOVERY_INCOMPLETE.` — fires once per run when any `.kt` file
+  failed to parse, naming the embeddable version operators are
+  pinned against and surfacing the `DISCOVERY_INCOMPLETE` escalation
+  link explicitly.
+- `Kotlin file <path> declares package <X> but path-derives to <Y>;
+  AST-driven strategies use the declared package, naming strategy
+  uses the path-derived FQN.` — fires per mismatch sample (same cap)
+  with the same `… and N more` summary, surfacing the over-selection
+  shape PR #1's hint described abstractly.
+- `Kotlin embeddable failed to load: <cause>. Treating .kt files as
+  unparseable for this run.` — fires once per run on bootstrap
+  failure, naming the underlying cause (`LogSanitizer`-stripped) so
+  operators can correlate against the matching plugin-status WARN.
+
+The polyglot `--explain` hint demoted: pre-PR-4 the unmapped-bucket
+hint named the residual languages and linked to issue #47; post-PR-4
+it is one line per distinct unmapped extension —
+`Non-Java/Kotlin source (<ext>) mapped via filename only; AST-driven
+strategies skipped (separate issue).` — and the issue-47 link drops
+because Kotlin is no longer one of the affected languages. The PR #1
+"Kotlin source mapped via filename only; AST-driven strategies
+skipped (issue #76)." line survives only on the
+`kotlinEnabled = false` fallback path so the escape hatch keeps a
+diagnostic signal.
+
+PR #4 also adds:
+
+- A new Cucumber feature (`10-issue-76-kotlin-ast.feature`, 7
+  scenarios) covering Naming / Usage / Implementation / Transitive
+  strategies on Kotlin fixtures plus the parse-failure and
+  path/package-mismatch diagnostic shapes — pins the four `--explain`
+  strings byte-stable end-to-end, not just in unit tests.
+- An update to the existing `09-issue-76-kotlin-path-derived-mapping.feature`
+  flipping K01/K02/K04 from the PR #1 "filename only" hint to the
+  PR #4 AST-mapped FQN hint, with K03's negative guards extended so
+  the demoted polyglot wording cannot silently regress back.
+- Updates to `AffectedTestTaskExplainFormatTest`'s polyglot-hint
+  fixtures matching the new shape, with `assertFalse` guards
+  against the pre-PR-4 wording (`currently maps only .java`,
+  `issues/47`) preserved as regression nets.
+- Documentation refresh: `AffectedTestsConfig`'s Javadoc, the
+  Gradle extension Javadoc, README "Known limitations", and the
+  Phase 2 design doc all describe the post-PR-4 state without
+  framing the system property as if it still existed.
+
 ### Added — Kotlin AST parser (issue #76, PR #3 of Phase 2)
 
 Wires `kotlin-compiler-embeddable:2.1.20` into the discovery engine

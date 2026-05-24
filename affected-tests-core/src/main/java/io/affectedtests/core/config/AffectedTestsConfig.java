@@ -215,29 +215,28 @@ public final class AffectedTestsConfig {
 
     /**
      * Whether the Kotlin AST-driven parser is registered for {@code .kt}
-     * files (issue #76 Phase 2, PR #3). Defaults to {@code false} during
-     * the rollout window; PR #4 flips the default to {@code true} and
-     * removes this knob.
+     * files (issue #76 Phase 2). Defaults to {@code true} as of PR #4 —
+     * Kotlin AST participation is now first-class. The pre-PR-4 system
+     * property ({@code -Daffected-tests.kotlin.enabled}) was removed
+     * with the default flip; the DSL flag
+     * ({@code affectedTests { kotlinEnabled = false }}) is the
+     * documented escape hatch for adopters who hit a regression.
      *
-     * <p>When {@code false}, {@code .kt} files keep the Phase 1 (PR #1)
-     * shape: path-derived FQN routing on the diff side, no AST-driven
-     * strategy participation. {@code DISCOVERY_INCOMPLETE} does not
-     * trigger for unparsed Kotlin in this mode — the absence is
-     * "by design" in the rollout phase, not a parse failure.
+     * <p>When {@code true} (default), {@code KotlinLanguageParser} is
+     * registered with the per-engine {@code LanguageParsers} registry;
+     * AST-driven strategies (Usage / Implementation / Transitive) start
+     * producing matches for Kotlin files; embeddable bootstrap
+     * failures fail closed via the {@link Situation#DISCOVERY_INCOMPLETE}
+     * escalation path (the WARN is logged once and every {@code .kt}
+     * in the run is treated as unparseable).
      *
-     * <p>When {@code true}, {@code KotlinLanguageParser} is registered
-     * with the per-engine {@code LanguageParsers} registry; AST-driven
-     * strategies (Usage / Implementation / Transitive) start producing
-     * matches for Kotlin files; embeddable bootstrap failures fail
-     * closed via the {@link Situation#DISCOVERY_INCOMPLETE} escalation
-     * path (the WARN is logged once and every {@code .kt} in the run
-     * is treated as unparseable).
+     * <p>When {@code false} (escape hatch), {@code .kt} files keep the
+     * Phase 1 (PR #1) shape: path-derived FQN routing on the diff side,
+     * no AST-driven strategy participation. {@code DISCOVERY_INCOMPLETE}
+     * does not trigger for unparsed Kotlin in this mode — the absence is
+     * "by design" under the escape hatch, not a parse failure.
      *
-     * <p>Wired from the system property
-     * {@code -Daffected-tests.kotlin.enabled=true} via
-     * {@code ProviderFactory.systemProperty(...)} at task-execution
-     * time so the read is configuration-cache compatible. The flag
-     * value participates in
+     * <p>The flag value participates in
      * {@link io.affectedtests.core.discovery.ProjectIndexCache#configHash(AffectedTestsConfig)}
      * so a flip across consecutive runs forces a full rescan rather
      * than reusing a half-Kotlin-shaped cache.
@@ -466,13 +465,19 @@ public final class AffectedTestsConfig {
         // false without touching code via -PaffectedTestsParallelDiscovery=false.
         private boolean parallelDiscovery = true;
 
-        // Issue #76 Phase 2 PR #3 — Kotlin AST parser is gated behind
-        // -Daffected-tests.kotlin.enabled=true while the rollout is in
-        // flight. Default OFF so adopters who upgrade across the PR
-        // boundary keep the Phase 1 (path-derived) behaviour until they
-        // explicitly opt in. PR #4 removes the gate and flips the
-        // default to ON. See docs/PHASE-2-KOTLIN-AST.md §9.
-        private boolean kotlinEnabled = false;
+        // Issue #76 Phase 2 PR #4 — Kotlin AST is now first-class
+        // (default ON). The {@code -Daffected-tests.kotlin.enabled}
+        // system property has been removed; adopters who hit a
+        // regression flip the DSL property
+        // ({@code affectedTests { kotlinEnabled = false }}) or
+        // route the affected sources via {@code outOfScopeSourceDirs}
+        // / {@code outOfScopeTestDirs}. See README "Known limitations"
+        // and docs/PHASE-2-KOTLIN-AST.md §9 PR #4 for the escape
+        // hatches. Default ON because the embeddable shading + JAR
+        // size budget were validated in PR #3 and the four pinned
+        // --explain strings let adopters audit the AST path on
+        // every run.
+        private boolean kotlinEnabled = true;
 
         private Mode mode;
         private Action onEmptyDiff;

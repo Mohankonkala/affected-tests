@@ -86,7 +86,8 @@ final class LanguageParsers implements AutoCloseable {
     private static final LanguageParsers DEFAULT_JAVA_ONLY =
             new LanguageParsers(Map.of(JavaLanguageParser.INSTANCE.extension(),
                     JavaLanguageParser.INSTANCE),
-                    /* lifecycleOwned */ false);
+                    /* lifecycleOwned */ false,
+                    KotlinDiagnostics.EMPTY);
 
     /**
      * Map of registered parsers, keyed by lowercased extension
@@ -108,7 +109,21 @@ final class LanguageParsers implements AutoCloseable {
      */
     private final boolean lifecycleOwned;
 
-    private LanguageParsers(Map<String, LanguageParser> byExtension, boolean lifecycleOwned) {
+    /**
+     * Per-engine Kotlin diagnostics carrier. Populated by
+     * {@link KotlinLanguageParser} on the four adopter-visible
+     * signals (issue #76 PR #4); read by the engine + AffectedTestTask
+     * to render the four pinned --explain strings. Set to
+     * {@link KotlinDiagnostics#EMPTY} for the Java-only registries
+     * (fallback singleton + Kotlin-disabled per-engine instances) so
+     * callers can read the field unconditionally without a null
+     * branch.
+     */
+    private final KotlinDiagnostics kotlinDiagnostics;
+
+    private LanguageParsers(Map<String, LanguageParser> byExtension,
+                            boolean lifecycleOwned,
+                            KotlinDiagnostics kotlinDiagnostics) {
         // Defensive copy + insertion order. {@link Map#copyOf}
         // produces an {@code ImmutableCollections.MapN} with
         // hash-based iteration for 2+ entries — wrapping a
@@ -121,6 +136,9 @@ final class LanguageParsers implements AutoCloseable {
         this.byExtension =
                 Collections.unmodifiableMap(new LinkedHashMap<>(byExtension));
         this.lifecycleOwned = lifecycleOwned;
+        this.kotlinDiagnostics = kotlinDiagnostics == null
+                ? KotlinDiagnostics.EMPTY
+                : kotlinDiagnostics;
     }
 
     /**
@@ -162,6 +180,16 @@ final class LanguageParsers implements AutoCloseable {
     static LanguageParsers forConfig(AffectedTestsConfig config) {
         LinkedHashMap<String, LanguageParser> parsers = new LinkedHashMap<>();
         parsers.put(JavaLanguageParser.INSTANCE.extension(), JavaLanguageParser.INSTANCE);
+        // Allocate the diagnostics carrier unconditionally. When
+        // Kotlin participation is off the carrier stays empty (no
+        // parser writes to it), but holding a non-null reference
+        // simplifies the engine read path: AffectedTestTask can
+        // unconditionally call {@code result.kotlinDiagnostics()}
+        // and skip the --explain block when {@link
+        // KotlinDiagnostics#isEmpty()} is true. The bytes saved by
+        // null-checking on the cold path are not worth the call-site
+        // branch.
+        KotlinDiagnostics kotlinDiagnostics = new KotlinDiagnostics();
         if (config.kotlinEnabled()) {
             // Construction is cheap — KotlinCoreEnvironment is built
             // lazily on the first .kt parse, not at registry build
@@ -170,10 +198,21 @@ final class LanguageParsers implements AutoCloseable {
             // engine actually parses a .kt file. See
             // docs/PHASE-2-KOTLIN-AST.md §3.4 for the lifecycle
             // protocol the parser implements.
-            KotlinLanguageParser kotlin = new KotlinLanguageParser();
+            KotlinLanguageParser kotlin = new KotlinLanguageParser(kotlinDiagnostics);
             parsers.put(kotlin.extension(), kotlin);
         }
-        return new LanguageParsers(parsers, /* lifecycleOwned */ true);
+        return new LanguageParsers(parsers, /* lifecycleOwned */ true, kotlinDiagnostics);
+    }
+
+    /**
+     * Returns the per-engine Kotlin diagnostics carrier shared by
+     * the registered {@link KotlinLanguageParser} (if any) with the
+     * engine and AffectedTestTask. Always non-null; returns
+     * {@link KotlinDiagnostics#EMPTY} when Kotlin participation is
+     * off so the renderer can poll without a null branch.
+     */
+    KotlinDiagnostics kotlinDiagnostics() {
+        return kotlinDiagnostics;
     }
 
     /**
@@ -181,9 +220,11 @@ final class LanguageParsers implements AutoCloseable {
      *         extension, or {@code null} if no parser is
      *         registered. {@code null} is the canonical signal for
      *         "this extension has no parser available in the
-     *         current rollout phase" (e.g. {@code .kt} when
-     *         {@code -Daffected-tests.kotlin.enabled} is false, or
-     *         always for {@code .kts} / {@code .groovy} /
+     *         current rollout phase" (e.g. {@code .kt} when the
+     *         DSL flag {@code kotlinEnabled} is set to {@code false}
+     *         — the documented escape hatch since PR #4 dropped the
+     *         system-property gate, defaulting Kotlin AST to on —
+     *         or always for {@code .kts} / {@code .groovy} /
      *         {@code .scala}). Callers translate {@code null} into
      *         "skip this file" — the same posture
      *         {@link LanguageParser#parseOrWarn} returning

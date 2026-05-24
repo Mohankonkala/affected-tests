@@ -504,15 +504,13 @@ class AffectedTestTaskExplainFormatTest {
 
     @Test
     void hintFiresOnUnmappedFileWithMixedPolyglotSources() {
-        // Post-PR-1 of issue #76: the polyglot hint
-        // ({@link AffectedTestTask#appendUnmappedFileHint}) lists
-        // languages that are still Java-only mapped — Groovy and
-        // Scala in this fixture. `.kt` (Kotlin) is no longer in
-        // that set, so it must NOT appear in the polyglot hint.
-        // The Kotlin file in this fixture instead routes through
-        // the new `Kotlin source unmapped (no matching source/test
-        // root)` hint emitted by
-        // {@link AffectedTestTask#appendKotlinMappingHints}.
+        // Post-PR-4 of issue #76: the polyglot hint
+        // ({@link AffectedTestTask#appendUnmappedFileHint}) is the
+        // demoted "non-class-bearing change" line, one entry per
+        // distinct unmapped extension. Groovy and Scala still
+        // qualify; `.kt` (Kotlin) is now AST-mapped so it does
+        // NOT appear in the polyglot hint, instead routing through
+        // the PR #1 "Kotlin source unmapped" hint.
         AffectedTestsConfig config = AffectedTestsConfig.builder().build();
         AffectedTestsResult result = new AffectedTestsResult(
                 Set.of(), Map.of(),
@@ -530,30 +528,36 @@ class AffectedTestTaskExplainFormatTest {
 
         String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
 
-        assertTrue(trace.contains("Groovy"),
-                "Polyglot hint must still list Groovy — Java-only mapped post-PR-1");
-        assertTrue(trace.contains("Scala"),
-                "Polyglot hint must still list Scala — Java-only mapped post-PR-1");
+        assertTrue(trace.contains("Non-Java/Kotlin source (.groovy) mapped via filename only;"
+                        + " AST-driven strategies skipped (separate issue)."),
+                "Demoted polyglot hint must fire one line per unmapped extension; "
+                        + ".groovy is still Java-only mapped post-PR-4");
+        assertTrue(trace.contains("Non-Java/Kotlin source (.scala) mapped via filename only;"
+                        + " AST-driven strategies skipped (separate issue)."),
+                "Demoted polyglot hint must fire for .scala too");
         assertTrue(trace.contains("Kotlin source unmapped"),
-                "Kotlin entry routes through the new PR #1 hint, not the "
+                "Kotlin entry routes through the PR #1 path-routing hint, not the "
                         + "polyglot one. The trace as a whole must still surface "
                         + "Kotlin to the operator.");
-        assertTrue(trace.contains("issues/47"),
-                "Polyglot hint still links to issue #47 because Groovy / Scala "
-                        + "are tracked there. The Kotlin row no longer drives the "
-                        + "link, but the link survives via the still-unmapped "
-                        + "languages.");
+        assertFalse(trace.contains("currently maps only .java"),
+                "Pre-PR-4 polyglot wording is gone — the demoted line is the "
+                        + "only polyglot hint shape post-PR-4.");
+        assertFalse(trace.contains("issues/47"),
+                "PR #4 dropped the issue-47 link from the polyglot hint — Kotlin "
+                        + "is now first-class and Groovy / Scala still tracked "
+                        + "via the demoted line itself.");
     }
 
     @Test
     void hintFiresOnUnmappedFileWithOnlyGroovyAndScala() {
         // Pin the surviving polyglot-hint coverage for the
-        // languages PR #1 left behind. A future commit removing
-        // `.groovy` from polyglotExtensionOf accidentally would
-        // pass `hintFiresOnUnmappedFileWhenKotlinSourcesPresent`
-        // (which now asserts ABSENCE of issues/47) but would fail
-        // here, where the Java-only-mapped languages are tested in
-        // isolation.
+        // languages PR #1 left behind and PR #4 demoted to the
+        // single "non-class-bearing change" line. A future commit
+        // removing `.groovy` from polyglotExtensionOf accidentally
+        // would pass `hintFiresOnUnmappedFileWhenKotlinSourcesPresent`
+        // (which asserts ABSENCE of the demoted line for `.kt`) but
+        // would fail here, where the Java-only-mapped languages are
+        // tested in isolation.
         AffectedTestsConfig config = AffectedTestsConfig.builder().build();
         AffectedTestsResult result = new AffectedTestsResult(
                 Set.of(), Map.of(),
@@ -569,11 +573,13 @@ class AffectedTestTaskExplainFormatTest {
 
         String trace = joined(AffectedTestTask.renderExplainTrace(config, result));
 
-        assertTrue(trace.contains("Groovy"));
-        assertTrue(trace.contains("Scala"));
-        assertTrue(trace.contains("currently maps only"),
-                "Polyglot-hint text must survive for languages still Java-only mapped");
-        assertTrue(trace.contains("issues/47"));
+        assertTrue(trace.contains("Non-Java/Kotlin source (.groovy)"),
+                "Demoted polyglot hint must still fire for .groovy");
+        assertTrue(trace.contains("Non-Java/Kotlin source (.scala)"),
+                "Demoted polyglot hint must still fire for .scala");
+        assertTrue(trace.contains("AST-driven strategies skipped (separate issue)."),
+                "Demoted-hint suffix must survive verbatim for languages still "
+                        + "Java-only mapped");
         assertFalse(trace.contains("Kotlin source unmapped"),
                 "PR #1's Kotlin-specific hint must NOT fire when no .kt files "
                         + "are in the bucket");

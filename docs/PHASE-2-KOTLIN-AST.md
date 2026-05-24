@@ -1024,6 +1024,22 @@ on null), and the strategy fallbacks already dispatch by extension.
   "non-class-bearing change" framing for the remaining unmapped
   polyglot cases:
   - `Non-Java/Kotlin source ({ext}) mapped via filename only; AST-driven strategies skipped (separate issue).`
+- **`--explain` strings (pinned verbatim, default-on)** — lands the
+  four AST-driven pinned strings deferred from PR #3. All four are
+  subject to the §9 string-stability contract above: the prefix
+  up to the first `{...}` placeholder and the suffix after the last
+  `{...}` placeholder are guaranteed stable across minor versions.
+  Adopters that grep these prefixes in CI logs will keep matching
+  across the rollout window.
+  - `Kotlin source AST-mapped to FQN {fqn}.`
+  - `Kotlin file failed to parse with embeddable {version}; counted into DISCOVERY_INCOMPLETE.`
+  - `Kotlin file {path} declares package {parsed} but path-derives to {path-derived}; AST-driven strategies use the declared package, naming strategy uses the path-derived FQN.`
+  - `Kotlin embeddable failed to load: {cause}. Treating .kt files as unparseable for this run.`
+- The PR #1 hint `Kotlin source mapped via filename only;
+  AST-driven strategies skipped (issue #76).` survives only on the
+  `kotlinEnabled = false` fallback path so the documented escape
+  hatch keeps a diagnostic signal for adopters who flip the DSL
+  flag back to false after hitting a regression.
 - Update `CHANGELOG.md` with explicit `[Breaking]` annotation only if
   the prototype consumer build (Section 11) shows any adopter saw a
   `Kotlin → FULL_SUITE` outcome they relied on (unlikely; the safety-net

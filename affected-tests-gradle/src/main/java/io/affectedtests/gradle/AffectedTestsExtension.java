@@ -111,30 +111,26 @@ public abstract class AffectedTestsExtension {
 
     /**
      * Whether to register the Kotlin AST-driven parser for {@code .kt}
-     * files (issue #76 Phase 2, PR #3). Defaults to {@code false} during
-     * the rollout window; PR #4 flips the default to {@code true} and
-     * removes this knob.
-     *
-     * <p>When {@code false}, {@code .kt} files keep the Phase 1 (PR #1)
-     * shape: path-derived FQN routing on the diff side, no AST-driven
-     * strategy participation. {@code DISCOVERY_INCOMPLETE} does not
-     * trigger for unparsed Kotlin in this mode — the absence is "by
-     * design" in the rollout phase, not a parse failure.
+     * files (issue #76 Phase 2, PR #4). Defaults to {@code true} —
+     * Kotlin sources participate in AST-driven discovery (Usage /
+     * Implementation / Transitive) on every run.
      *
      * <p>When {@code true}, {@code KotlinLanguageParser} is registered
      * with the per-engine {@code LanguageParsers} registry; AST-driven
-     * strategies (Usage / Implementation / Transitive) start producing
-     * matches for Kotlin files; embeddable bootstrap failures fail
-     * closed via {@code DISCOVERY_INCOMPLETE} (the WARN is logged once
-     * and every {@code .kt} in the run is treated as unparseable).
+     * strategies start producing matches for Kotlin files; embeddable
+     * bootstrap failures fail closed via {@code DISCOVERY_INCOMPLETE}
+     * (the WARN is logged once and every {@code .kt} in the run is
+     * treated as unparseable).
      *
-     * <p>The system property
-     * {@code -Daffected-tests.kotlin.enabled=true} provides the same
-     * kill switch without touching the DSL. The property accepts
-     * {@code true|false|1|0|on|off|yes|no} (case-insensitive); typo'd
-     * values are rejected with a build-log WARN rather than silently
-     * flipping the switch — the same posture
-     * {@code -PaffectedTestsParallelDiscovery} takes.
+     * <p>When {@code false}, {@code .kt} files fall back to the
+     * Phase 1 (PR #1) shape: path-derived FQN routing on the diff
+     * side, no AST-driven strategy participation, no
+     * {@code DISCOVERY_INCOMPLETE} on unparsed Kotlin — the absence
+     * is "by design" rather than a parse failure. Use this kill
+     * switch only as a regression escape hatch; PR #4 removed the
+     * {@code -Daffected-tests.kotlin.enabled} system property
+     * because the rollout window closed and the AST path is now
+     * first-class.
      *
      * @return the Kotlin-enabled property
      */

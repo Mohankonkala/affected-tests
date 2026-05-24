@@ -1,18 +1,20 @@
 Feature: Issue #76 PR #1 — Kotlin path-derived mapping
   Phase 2 PR #1 of issue #76 lifts Kotlin sources from the unmapped
-  bucket into the same path-derived mapping pipeline as `.java`. The
-  scenarios below pin the adopter-visible behaviour change so a
-  regression to "Kotlin in unmapped → FULL_SUITE" is caught at
-  TestKit-build latency, not after a Kotlin shop files an issue.
+  bucket into the same mapping pipeline as `.java`. The scenarios
+  below pin the adopter-visible behaviour change so a regression to
+  "Kotlin in unmapped → FULL_SUITE" is caught at TestKit-build
+  latency, not after a Kotlin shop files an issue.
 
   Phase 1 (already shipped) added the polyglot `--explain` hint.
-  PR #1 narrows it for Kotlin: a `.kt` that maps now emits the new
-  "Kotlin source mapped via filename only" hint. A `.kt` that lands
-  in the unmapped bucket (file outside any configured source/test
-  root) emits the new "Kotlin source unmapped" hint. PR #3 lights
-  up the AST path; PR #4 makes it default and demotes both PR #1
-  hints. See docs/PHASE-2-KOTLIN-AST.md §9 for the full string
-  stability contract.
+  PR #1 narrowed it for Kotlin: a `.kt` that maps now emits a
+  pinned hint, and a `.kt` that lands in the unmapped bucket emits
+  the "Kotlin source unmapped" hint. PR #4 demoted PR #1's
+  "mapped via filename only" hint behind the `kotlinEnabled = false`
+  fallback path; the default rollout (kotlinEnabled = true) now
+  emits "Kotlin source AST-mapped to FQN ..." instead. The
+  scenarios below assert against the new default. See
+  docs/PHASE-2-KOTLIN-AST.md §9 for the full string stability
+  contract.
 
   Background:
     Given a freshly initialised project with a committed baseline
@@ -41,7 +43,7 @@ Feature: Issue #76 PR #1 — Kotlin path-derived mapping
     And the situation is DISCOVERY_SUCCESS
     And the action is SELECTED
     And the outcome is "SELECTED — 1 test class(es) will run"
-    And the output contains "Kotlin source mapped via filename only; AST-driven strategies skipped (issue #76)."
+    And the output contains "Kotlin source AST-mapped to FQN com.example.Foo."
 
   Scenario: K02 — top-level Kotlin function file with <basename>Kt test neighbour selects via synthetic FQN
     # Kotlin top-level functions in `Util.kt` compile to a class
@@ -88,12 +90,14 @@ Feature: Issue #76 PR #1 — Kotlin path-derived mapping
     And the situation is UNMAPPED_FILE
     And the action is FULL_SUITE
     And the output contains "Kotlin source unmapped (no matching source/test root); routed to unmapped bucket."
-    # Pin the contract that PR #1 narrowed the polyglot hint: the
-    # legacy "currently maps only .java" wording would contradict
-    # the new pinned hint and confuse adopters reading both lines.
-    # A regression that re-introduces `.kt` to `polyglotExtensionOf`
+    # Pin the contract that PR #1 narrowed the polyglot hint and
+    # PR #4 demoted the rest: the legacy "currently maps only
+    # .java" wording would contradict the new pinned hint and
+    # confuse adopters reading both lines. A regression that
+    # re-introduces `.kt` to `polyglotExtensionOf` or that revives
+    # the pre-PR-4 "the plugin currently maps only .java" wording
     # would silently pass K03's positive assertion above without
-    # this negative guard.
+    # these negative guards.
     And the output does not contain "currently maps only .java"
     And the output does not contain "issues/47"
 
@@ -132,7 +136,7 @@ Feature: Issue #76 PR #1 — Kotlin path-derived mapping
     And the situation is DISCOVERY_SUCCESS
     And the action is SELECTED
     And the outcome is "SELECTED — 2 test class(es) will run"
-    And the output contains "Kotlin source mapped via filename only; AST-driven strategies skipped (issue #76)."
+    And the output contains "Kotlin source AST-mapped to FQN com.example.KotlinProd."
 
   Scenario: K05 — test-only Kotlin diff selects only the touched Kotlin test
     # Symmetric to S03 (Java test-only diff). The test file IS the
@@ -157,3 +161,12 @@ Feature: Issue #76 PR #1 — Kotlin path-derived mapping
     And the situation is DISCOVERY_SUCCESS
     And the action is SELECTED
     And the outcome is "SELECTED — 1 test class(es) will run"
+    # Negative guard: the test-only fast path
+    # ({@code AffectedTestsEngine.runTestOnlyFastPath}) must NOT
+    # construct a ProjectIndex or engage KotlinLanguageParser, so no
+    # AST-mapped FQN sample should be recorded for this run. A future
+    # refactor that drops the fast path (or accidentally wires the
+    # parser into it) would silently start emitting the AST-mapped
+    # hint here without breaking the positive assertions above; the
+    # negative guard makes that drift a TestKit-build failure.
+    And the output does not contain "Kotlin source AST-mapped to FQN"

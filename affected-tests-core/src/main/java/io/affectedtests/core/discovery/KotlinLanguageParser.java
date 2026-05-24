@@ -51,21 +51,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@link KotlinCoreEnvironment#createForProduction} runs. Two
  * {@link KotlinLanguageParser} instances alive in the same JVM
  * (e.g. multi-module Gradle build with {@code --parallel} and
- * {@code -Daffected-tests.kotlin.enabled=true}) collide on that
- * slot. PR #3 ships the rollout flag default-off so the collision
- * is theoretical for the rollout window; PR #4's flag-flip carries
- * the multi-module-parallel acceptance gate (refcounted singleton
- * or documented fallback to non-parallel discovery on adopters
- * that flip the flag).
+ * {@code kotlinEnabled = true}) collide on that slot. PR #3 shipped
+ * the rollout flag default-off so the collision was theoretical for
+ * the rollout window; PR #4 flipped the default and the multi-module
+ * parallel posture is now load-bearing — adopters who hit a
+ * collision flip {@code kotlinEnabled = false} as the documented
+ * escape hatch (see README "Known limitations").
  *
  * <p>Introduced in PR #3 of issue #76 (Phase 2 Kotlin AST). The class
  * is registered with {@link LanguageParsers} only when
  * {@link io.affectedtests.core.config.AffectedTestsConfig#kotlinEnabled()}
- * is {@code true} (the rollout knob is gated on
- * {@code -Daffected-tests.kotlin.enabled=true}; default off until
- * PR #4). When the flag is off, every {@code .kt} file flows through
- * the path-derived FQN routing PR #1 introduced — no AST, no
- * AST-driven strategy participation.
+ * is {@code true}, which is the post-PR-4 default. The pre-PR-4
+ * system-property gate ({@code -Daffected-tests.kotlin.enabled})
+ * was removed when the rollout closed; the DSL flag is the
+ * remaining knob. When the flag is set to {@code false}, every
+ * {@code .kt} file flows through the path-derived FQN routing
+ * PR #1 introduced — no AST, no AST-driven strategy participation.
  *
  * <h3>Lifecycle</h3>
  *
@@ -199,12 +200,44 @@ final class KotlinLanguageParser implements LanguageParser {
     private final Set<Path> fileHasJvmNameAnnotation =
             java.util.Collections.synchronizedSet(new java.util.HashSet<>());
 
+    /**
+     * Per-engine carrier the parser writes to on the four
+     * adopter-visible signals (AST-mapped success, parse failure,
+     * embeddable load failure — path-vs-package mismatch is recorded
+     * by the engine, not by the parser, because it requires the
+     * path-derived FQN context the parser does not own). Owned by
+     * the {@link LanguageParsers} that constructed this instance and
+     * exposed via {@link ProjectIndex#kotlinDiagnostics()} so
+     * {@code AffectedTestTask}'s --explain renderer can pin the four
+     * verbatim strings (issue #76 PR #4).
+     *
+     * <p>Constructor-injected so the parser does not have to know
+     * how diagnostics are wired into the engine result; tests that
+     * exercise the parser directly pass {@link KotlinDiagnostics#EMPTY}
+     * (or a fresh instance when they want to assert on counter
+     * values without spinning up a {@link ProjectIndex}).
+     */
+    private final KotlinDiagnostics diagnostics;
+
     /** Lazy-bootstrapped on first parse. {@code null} until then. */
     private volatile KotlinCoreEnvironment environment;
     /** Lifecycle parent for {@link #environment}. {@code null} until first parse. */
     private volatile Disposable parentDisposable;
 
+    /**
+     * Convenience constructor used by tests that exercise the parser
+     * directly without an engine-supplied diagnostics carrier.
+     * Production callers go through
+     * {@link LanguageParsers#forConfig(io.affectedtests.core.config.AffectedTestsConfig)}
+     * which threads its per-engine {@link KotlinDiagnostics} into
+     * the parser via the explicit constructor.
+     */
     KotlinLanguageParser() {
+        this(KotlinDiagnostics.EMPTY);
+    }
+
+    KotlinLanguageParser(KotlinDiagnostics diagnostics) {
+        this.diagnostics = diagnostics == null ? KotlinDiagnostics.EMPTY : diagnostics;
     }
 
     @Override
@@ -355,11 +388,38 @@ final class KotlinLanguageParser implements LanguageParser {
                 // the run is unparseable, not "engine throws and
                 // adopter sees an obscure stack trace".
                 bootstrapFailed.set(true);
+                // Carry the cause to {@link KotlinDiagnostics} so
+                // {@code AffectedTestTask}'s --explain renderer can
+                // pin the {@code Kotlin embeddable failed to load:
+                // {cause}.} line (issue #76 PR #4 — one of the four
+                // verbatim strings). First-cause-wins semantics
+                // inside the diagnostics carrier handle the case
+                // where two threads race the bootstrap; only one
+                // string ends up in the explain trace, matching
+                // what the WARN-line below already promises.
+                //
+                // Build the cause string defensively: the most
+                // adopter-relevant bootstrap failure shape — a
+                // shading regression that surfaces as a no-message
+                // {@code LinkageError} or {@code NoClassDefFoundError}
+                // — has {@link Throwable#getMessage()} returning
+                // {@code null}. {@code String.valueOf(null)} would
+                // emit the four-character literal "null" into the
+                // pinned explain trace, defeating the whole reason
+                // the cause-carrying field exists. Prefer the
+                // exception type when no message is available so the
+                // operator at least learns whether they hit a
+                // {@code LinkageError}, an {@code AssertionError},
+                // or some other class.
+                String cause = t.getMessage() != null
+                        ? t.getMessage()
+                        : t.getClass().getName();
+                diagnostics.recordEmbeddableLoadFailure(cause);
                 log.warn("Affected Tests: [{}] Kotlin language parser bootstrap failed; "
                                 + "every .kt file in this run will be treated as unparseable "
                                 + "(DISCOVERY_INCOMPLETE escalation depends on the configured "
                                 + "action for Situation.DISCOVERY_INCOMPLETE). Cause: {}",
-                        label, LogSanitizer.sanitize(String.valueOf(t.getMessage())));
+                        label, LogSanitizer.sanitize(cause));
                 log.debug("Affected Tests: Kotlin bootstrap failure stack trace", t);
                 return null;
             } finally {
@@ -446,6 +506,19 @@ final class KotlinLanguageParser implements LanguageParser {
         if (hasFileLevelJvmName(ktFile)) {
             fileHasJvmNameAnnotation.add(file);
         }
+
+        // Record the AST-mapped FQN on the engine's diagnostics
+        // carrier so {@code AffectedTestTask}'s --explain renderer
+        // can pin the {@code Kotlin source AST-mapped to FQN {fqn}.}
+        // line. The FQN format mirrors what the JVM compiler emits:
+        // {@code <package>.<primaryTypeName>} for class-bearing files,
+        // {@code <package>.<basename>Kt} for class-less files (the
+        // synthetic-facade contract Phase 2 PR #1 built into
+        // {@link io.affectedtests.core.mapping.PathToClassMapper}).
+        // The empty-package case drops the leading dot to keep the
+        // string readable when an adopter's diff sits at the
+        // source-root level.
+        diagnostics.recordAstMapped(KotlinDiagnostics.joinFqn(packageName, primaryTypeName));
 
         return new FileMetadata(packageName, primaryTypeName, imports,
                 simpleNames, dottedNames, typeDecls);

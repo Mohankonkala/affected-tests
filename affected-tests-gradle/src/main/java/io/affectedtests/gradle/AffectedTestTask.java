@@ -157,17 +157,16 @@ public abstract class AffectedTestTask extends DefaultTask {
 
     /**
      * Whether to register the Kotlin AST parser for {@code .kt} files
-     * (issue #76 Phase 2, PR #3). Default {@code false} during the
-     * rollout window; PR #4 flips the default. Wired from the
-     * {@code kotlinEnabled} extension property; can also be set
-     * per-invocation via the system property
-     * {@code -Daffected-tests.kotlin.enabled=true} (read at task-
-     * execution time via
-     * {@link org.gradle.api.provider.ProviderFactory#systemProperty}
-     * for configuration-cache safety). The flag value participates
-     * in the project-index cache hash so a flip across consecutive
-     * runs forces a clean rescan rather than reusing rows the new
-     * flag value would not produce.
+     * (issue #76 Phase 2, PR #4). Default {@code true} — Kotlin
+     * sources participate in AST-driven discovery (Usage / Impl /
+     * Transitive) on every run. The {@code -Daffected-tests.kotlin.enabled}
+     * system property has been removed; adopters who hit a regression
+     * flip the DSL property to {@code false} or route the affected
+     * sources via {@code outOfScopeSourceDirs} / {@code outOfScopeTestDirs}.
+     *
+     * <p>The flag value participates in the project-index cache hash
+     * so a flip across consecutive runs forces a clean rescan rather
+     * than reusing rows the new flag value would not produce.
      *
      * @return the Kotlin-enabled property
      */
@@ -529,7 +528,7 @@ public abstract class AffectedTestTask extends DefaultTask {
                 .includeImplementationTests(getIncludeImplementationTests().get())
                 .implementationNaming(getImplementationNaming().get())
                 .parallelDiscovery(getParallelDiscovery().getOrElse(true))
-                .kotlinEnabled(getKotlinEnabled().getOrElse(false));
+                .kotlinEnabled(getKotlinEnabled().getOrElse(true));
 
         if (getIgnorePaths().isPresent() && !getIgnorePaths().get().isEmpty()) {
             builder.ignorePaths(getIgnorePaths().get());
@@ -1504,14 +1503,14 @@ public abstract class AffectedTestTask extends DefaultTask {
         // full routing.
         appendSituationHint(lines, config, result);
 
-        // Phase 2 PR #1 of issue #76: Kotlin sources now map via
-        // path-derived FQN (filename only — no AST). Surface a
-        // pinned hint whenever the diff contained a .kt file so
-        // adopters can grep their CI logs for the rollout signal.
-        // Independent of {@link #appendSituationHint} because it
-        // fires on every situation that mapped Kotlin, not only
-        // the mapper-touching ones.
-        appendKotlinMappingHints(lines, result);
+        // Phase 2 PR #1 of issue #76 introduced the path-derived
+        // Kotlin mapping hint; PR #4 extends it to the four pinned
+        // AST-driven --explain strings (AST-mapped FQN, parse
+        // failure with embeddable version, path-vs-package mismatch,
+        // embeddable load failure). The dispatcher routes between
+        // them based on the per-engine {@link KotlinDiagnostics}
+        // and the buckets — see method Javadoc for the full table.
+        appendKotlinMappingHints(lines, config, result);
 
         // Per-module dispatch preview — populated only for
         // SELECTED runs so the "what tasks will Gradle actually
@@ -1790,15 +1789,27 @@ public abstract class AffectedTestTask extends DefaultTask {
     /**
      * Fires on {@link Situation#UNMAPPED_FILE} runs whose unmapped
      * bucket contains files in well-known polyglot JVM extensions
-     * (Kotlin, Groovy, Scala). Surfaces the Java-only-mapping
-     * limitation as an explicit hint pointing at issue #47, so
-     * adopters who land their first Kotlin / Groovy / Scala edit
-     * don't have to read the source (or wait through a full-suite CI
-     * run on every MR for two days) to find out why selection
-     * suddenly degraded. Silent on UNMAPPED_FILE runs whose unmapped
-     * bucket is purely config / asset / yaml — those are the
-     * "expected" UNMAPPED_FILE shape and the {@code Outcome:} line
-     * already explains them.
+     * the plugin still cannot map ({@code .kts}, {@code .groovy},
+     * {@code .scala}). Phase 2 PR #4 of issue #76 demotes the
+     * pre-PR-4 framing — which read like an "AST-driven strategies
+     * skipped" rollout signal pointing at the Java-only-mapping
+     * limitation — to a single non-class-bearing-change line per
+     * extension, matching the new reality after Kotlin AST
+     * participation became default-on:
+     *
+     * <pre>{@code
+     * Hint:            Non-Java/Kotlin source (.scala) mapped via filename only; AST-driven strategies skipped (separate issue).
+     * }</pre>
+     *
+     * <p>Stable in its full literal form across PR #4+ — adopters
+     * grepping for the older "the plugin currently maps only .java"
+     * wording will hit nothing and need to migrate, which is
+     * exactly the rollout signal we want at version-bump time.
+     *
+     * <p>Silent on UNMAPPED_FILE runs whose unmapped bucket is
+     * purely config / asset / yaml — those are the "expected"
+     * UNMAPPED_FILE shape and the {@code Outcome:} line already
+     * explains them.
      */
     private static void appendUnmappedFileHint(List<String> lines,
                                                AffectedTestsResult result) {
@@ -1812,91 +1823,192 @@ public abstract class AffectedTestTask extends DefaultTask {
         if (polyglotExts.isEmpty()) {
             return;
         }
-        // Map raw extensions to user-facing language names so the
-        // hint reads like a sentence rather than a glob list. The
-        // ordering follows decreasing real-world frequency (Kotlin
-        // first — Spring Boot + Kotlin is by far the most common
-        // mixed-source shape we'll see this hint fire on).
-        // Pre-PR-1 of issue #76 this map included `.kt` → Kotlin.
-        // PR #1 moved Kotlin out of the polyglot hint entirely (see
-        // {@link #polyglotExtensionOf} for why), so it is omitted
-        // here too. `.kts` (Kotlin script) remains Java-only mapped
-        // and still maps to "Kotlin" — adopters who edit a `.kts`
-        // build script unrelated to a `.gradle.kts` file see the
-        // hint and recognise their language.
-        java.util.Map<String, String> displayNames = new java.util.LinkedHashMap<>();
-        displayNames.put(".kts",    "Kotlin");
-        displayNames.put(".groovy", "Groovy");
-        displayNames.put(".gvy",    "Groovy");
-        displayNames.put(".scala",  "Scala");
-        displayNames.put(".sc",     "Scala");
-        java.util.Set<String> langs = new java.util.LinkedHashSet<>();
+        // Emit one demoted line per distinct extension so adopters
+        // hitting more than one polyglot family in a single MR see
+        // each one named explicitly. Insertion order is preserved
+        // (LinkedHashSet) so the hint output is byte-stable for any
+        // given diff shape.
         for (String ext : polyglotExts) {
-            String name = displayNames.get(ext);
-            if (name != null) {
-                langs.add(name);
-            }
+            lines.add("Hint:            Non-Java/Kotlin source ("
+                    + ext + ") mapped via filename only; "
+                    + "AST-driven strategies skipped (separate issue).");
         }
-        if (langs.isEmpty()) {
-            return;
-        }
-        String langList = String.join(" / ", langs);
-        lines.add("Hint:            the unmapped bucket includes "
-                + langList + " sources — the plugin currently maps only");
-        lines.add("                 .java, so any " + langList + " edit falls through "
-                + "to UNMAPPED_FILE and");
-        lines.add("                 escalates to FULL_SUITE under the ci / strict "
-                + "profiles. Tracking issue:");
-        lines.add("                 https://github.com/vedanthvdev/affected-tests/issues/47");
     }
 
     /**
-     * Phase 2 PR #1 of issue #76: emits one of two pinned
-     * {@code --explain} lines based on which buckets contain
-     * {@code .kt} files. Stable across plugin versions so adopters
-     * can grep their CI logs for the rollout signal.
+     * Renders the Kotlin-specific {@code --explain} hint block.
+     * Routes between the three rollout-era strings based on
+     * {@link AffectedTestsConfig#kotlinEnabled()} and the per-engine
+     * {@link io.affectedtests.core.discovery.KotlinDiagnostics}.
+     *
+     * <h4>Phase 2 PR #4 (default-on) — four pinned AST-driven strings</h4>
+     *
+     * <p>When {@code config.kotlinEnabled()} is true and the parser
+     * actually ran on at least one {@code .kt} file in the run, one
+     * or more of these fire (from {@link io.affectedtests.core.discovery.KotlinDiagnostics}):
+     *
+     * <ul>
+     *   <li>{@code Kotlin embeddable failed to load: {cause}. Treating
+     *       .kt files as unparseable for this run.} — fires once when
+     *       the {@code KotlinCoreEnvironment} bootstrap threw. The
+     *       cause is the underlying exception's message, sanitised
+     *       for log forgery.</li>
+     *   <li>{@code Kotlin file failed to parse with embeddable
+     *       {version}; counted into DISCOVERY_INCOMPLETE.} — fires
+     *       once when at least one {@code .kt} file returned
+     *       {@code null} from the parser. The WARN line at the
+     *       failure site has already named the specific file; this
+     *       hint is the per-run summary.</li>
+     *   <li>{@code Kotlin file {path} declares package {parsed} but
+     *       path-derives to {path-derived}; AST-driven strategies use
+     *       the declared package, naming strategy uses the path-
+     *       derived FQN.} — fires once per distinct mismatched file
+     *       (capped at {@link
+     *       io.affectedtests.core.discovery.KotlinDiagnostics#SAMPLE_LIMIT}).
+     *       Surfaces the under-selection risk: the AST and the
+     *       diff-side mapper disagree on the FQN.</li>
+     *   <li>{@code Kotlin source AST-mapped to FQN {fqn}.} — fires
+     *       once per distinct AST-mapped FQN (same cap), oldest-first
+     *       insertion order. A "+N more" tail when truncated. The
+     *       absence of every other Kotlin hint while this fires is
+     *       the "happy path" rollout signal an adopter looks for.</li>
+     * </ul>
+     *
+     * <h4>Phase 2 PR #1 — path-derived fallback strings</h4>
+     *
+     * <p>When {@code config.kotlinEnabled()} is false (adopter
+     * explicitly disabled in DSL, or the engine hit a Kotlin-free
+     * fast path), the original PR #1 hints route the explanation:
      *
      * <ul>
      *   <li>{@code Kotlin source mapped via filename only;
-     *       AST-driven strategies skipped (issue #76).} fires when
+     *       AST-driven strategies skipped (issue #76).} — fires when
      *       any {@code .kt} file landed in
      *       {@link io.affectedtests.core.AffectedTestsResult.Buckets#productionFiles()}
      *       or
      *       {@link io.affectedtests.core.AffectedTestsResult.Buckets#testFiles()}.
-     *       Tells adopters that the file was selected via path-
-     *       derived FQN (NamingConventionStrategy + UsageStrategy
-     *       tier 1 import lookup against the synthetic
-     *       {@code <basename>Kt} class), not via AST. PR #3 lights
-     *       up the AST path; PR #4 makes it default.</li>
+     *       Tells adopters that the file was selected via path-derived
+     *       FQN (NamingConventionStrategy + UsageStrategy tier 1
+     *       import lookup against the synthetic {@code <basename>Kt}
+     *       class), not via AST.</li>
+     * </ul>
+     *
+     * <h4>Path-routing string — fires on either rollout phase</h4>
+     *
+     * <ul>
      *   <li>{@code Kotlin source unmapped (no matching source/test
-     *       root); routed to unmapped bucket.} fires when any
+     *       root); routed to unmapped bucket.} — fires when any
      *       {@code .kt} file landed in
      *       {@link io.affectedtests.core.AffectedTestsResult.Buckets#unmappedFiles()}.
      *       Distinct from the older polyglot hint
      *       ({@link #appendUnmappedFileHint}) which still fires for
      *       Groovy / Scala / {@code .kts} — those remain Java-only
-     *       mapped pending separate follow-ups. Pre-PR-1 the polyglot
-     *       hint was the catch-all for {@code .kt} too; the new
-     *       string narrows the diagnosis: a {@code .kt} in unmapped
-     *       post-PR-1 means the file path didn't match any
-     *       configured source / test root, not that the plugin
-     *       can't map Kotlin extensions.</li>
+     *       mapped pending separate follow-ups. The string narrows
+     *       the diagnosis: a {@code .kt} in unmapped means the file
+     *       path didn't match any configured source / test root, not
+     *       that the plugin can't map Kotlin extensions.</li>
      * </ul>
      */
     static void appendKotlinMappingHints(List<String> lines,
+                                         AffectedTestsConfig config,
                                          AffectedTestsResult result) {
         Buckets buckets = result.buckets();
         boolean kotlinMapped = anyKotlin(buckets.productionFiles())
                 || anyKotlin(buckets.testFiles());
         boolean kotlinUnmapped = anyKotlin(buckets.unmappedFiles());
 
+        // Path-routing hint fires in either rollout phase: it tells
+        // adopters their .kt sits outside any configured source / test
+        // root, which is independent of whether the AST parser is
+        // engaged.
+        if (kotlinUnmapped) {
+            lines.add("Hint:            Kotlin source unmapped"
+                    + " (no matching source/test root); routed to unmapped bucket.");
+        }
+
+        io.affectedtests.core.discovery.KotlinDiagnostics diag = result.kotlinDiagnostics();
+        if (config.kotlinEnabled() && diag != null && !diag.isEmpty()) {
+            appendKotlinAstHints(lines, diag);
+            return;
+        }
+
+        // Fallback path: PR #1 hint preserved verbatim for adopters
+        // who flipped {@code kotlinEnabled = false} in the DSL after
+        // PR #4 (the documented escape hatch — see README known
+        // limitations section).
         if (kotlinMapped) {
             lines.add("Hint:            Kotlin source mapped via filename only;"
                     + " AST-driven strategies skipped (issue #76).");
         }
-        if (kotlinUnmapped) {
-            lines.add("Hint:            Kotlin source unmapped"
-                    + " (no matching source/test root); routed to unmapped bucket.");
+    }
+
+    /**
+     * Emits the four pinned AST-driven Kotlin --explain strings
+     * (issue #76 PR #4) in the order operators read them most
+     * naturally: the load-failure case first (because it dominates
+     * every subsequent line if it fires), then per-run summaries
+     * (parse failures, mismatches), then the per-FQN AST-mapped
+     * sample. Each line is rendered verbatim against the pinned
+     * template — the substitution slots are sanitised at the
+     * boundary so an attacker-committable filename or package name
+     * cannot forge a fake plugin-status log line.
+     */
+    private static void appendKotlinAstHints(
+            List<String> lines,
+            io.affectedtests.core.discovery.KotlinDiagnostics diag) {
+        String loadFailure = diag.embeddableLoadFailureCause();
+        if (loadFailure != null && !loadFailure.isEmpty()) {
+            lines.add("Hint:            Kotlin embeddable failed to load: "
+                    + LogSanitizer.sanitize(loadFailure)
+                    + ". Treating .kt files as unparseable for this run.");
+        }
+        if (diag.parseFailureCount() > 0) {
+            lines.add("Hint:            Kotlin file failed to parse with embeddable "
+                    + io.affectedtests.core.discovery.KotlinDiagnostics.EMBEDDABLE_VERSION
+                    + "; counted into DISCOVERY_INCOMPLETE.");
+        }
+        if (diag.pathPackageMismatchCount() > 0) {
+            int rendered = 0;
+            for (var sample : diag.mismatchSamples()) {
+                if (rendered >= EXPLAIN_SAMPLE_LIMIT) break;
+                lines.add("Hint:            Kotlin file "
+                        + LogSanitizer.sanitize(String.valueOf(sample.file()))
+                        + " declares package "
+                        + LogSanitizer.sanitize(sample.parsedPackage())
+                        + " but path-derives to "
+                        + LogSanitizer.sanitize(sample.pathDerivedPackage())
+                        + "; AST-driven strategies use the declared package, "
+                        + "naming strategy uses the path-derived FQN.");
+                rendered++;
+            }
+            // Only emit the "… and N more" tail when at least one
+            // sample line preceded it. With the post-review null-input
+            // guards in {@link KotlinDiagnostics#recordPathPackageMismatch}
+            // counter and sample size stay in lockstep, but the guard
+            // protects against a future refactor that loosens that
+            // invariant: a bare "… and 1 more" with no sample line
+            // above it is an unhelpful trace that suggests the
+            // renderer is broken rather than that the data was
+            // malformed.
+            if (rendered > 0 && diag.pathPackageMismatchCount() > rendered) {
+                lines.add("Hint:            … and "
+                        + (diag.pathPackageMismatchCount() - rendered)
+                        + " more Kotlin file(s) with path/package mismatch.");
+            }
+        }
+        if (diag.astMappedCount() > 0) {
+            int rendered = 0;
+            for (String fqn : diag.astMappedFqnSamples()) {
+                if (rendered >= EXPLAIN_SAMPLE_LIMIT) break;
+                lines.add("Hint:            Kotlin source AST-mapped to FQN "
+                        + LogSanitizer.sanitize(fqn) + ".");
+                rendered++;
+            }
+            if (rendered > 0 && diag.astMappedCount() > rendered) {
+                lines.add("Hint:            … and "
+                        + (diag.astMappedCount() - rendered)
+                        + " more Kotlin source(s) AST-mapped this run.");
+            }
         }
     }
 
