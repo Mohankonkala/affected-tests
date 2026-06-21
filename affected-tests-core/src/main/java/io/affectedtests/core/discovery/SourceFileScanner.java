@@ -57,9 +57,9 @@ public final class SourceFileScanner {
      * @param dir root directory to walk
      * @return list of paths to {@code .java} / {@code .kt} files
      */
-    public static List<Path> collectJavaFiles(Path dir) {
+    public static List<Path> collectSourceFiles(Path dir) {
         List<Path> files = new ArrayList<>();
-        collectJavaFiles(dir, files);
+        collectSourceFiles(dir, files);
         return files;
     }
 
@@ -99,7 +99,7 @@ public final class SourceFileScanner {
      * readable siblings of the unreadable subtree vanished from
      * discovery without any signal to the operator.
      */
-    public static void collectJavaFiles(Path dir, List<Path> result) {
+    public static void collectSourceFiles(Path dir, List<Path> result) {
         try {
             Files.walkFileTree(dir, new SimpleFileVisitor<>() {
                 @Override
@@ -157,7 +157,7 @@ public final class SourceFileScanner {
         List<Path> files = new ArrayList<>();
         for (String sourceDir : sourceDirs) {
             for (Path resolved : findAllMatchingDirs(projectDir, sourceDir)) {
-                collectJavaFiles(resolved, files);
+            	collectSourceFiles(resolved, files);
                 if (resolvedRoots != null) {
                     resolvedRoots.add(resolved);
                 }
@@ -191,7 +191,7 @@ public final class SourceFileScanner {
         List<Path> files = new ArrayList<>();
         for (String testDir : testDirs) {
             for (Path resolved : findAllMatchingDirs(projectDir, testDir)) {
-                collectJavaFiles(resolved, files);
+            	collectSourceFiles(resolved, files);
                 if (resolvedRoots != null) {
                     resolvedRoots.add(resolved);
                 }
@@ -247,7 +247,7 @@ public final class SourceFileScanner {
                 @Override
                 public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
                     // Same symlink + containment contract as
-                    // collectJavaFiles: file symlinks are never walked
+                    // collectSourceFiles: file symlinks are never walked
                     // because the real path can escape the project
                     // root (DoS + data-exfiltration surface when the
                     // plugin runs on merge-gate CI against an
@@ -447,7 +447,7 @@ public final class SourceFileScanner {
      * {@link Files#isDirectory(Path, java.nio.file.LinkOption...)} call
      * without {@link LinkOption#NOFOLLOW_LINKS} would follow the
      * symlink and produce a match pointing at the CI runner's
-     * filesystem root, which a subsequent {@link #collectJavaFiles}
+     * filesystem root, which a subsequent {@link #collectSourceFiles}
      * would then happily enumerate.
      *
      * <p>When {@code projectRoot} is {@code null} (e.g. the project

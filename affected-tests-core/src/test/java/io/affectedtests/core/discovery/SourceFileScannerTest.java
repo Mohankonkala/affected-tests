@@ -190,7 +190,7 @@ class SourceFileScannerTest {
             return;
         }
 
-        List<Path> collected = SourceFileScanner.collectJavaFiles(
+        List<Path> collected = SourceFileScanner.collectSourceFiles(
                 tempDir.resolve("src/main/java"));
 
         assertEquals(1, collected.size(),
@@ -261,7 +261,7 @@ class SourceFileScannerTest {
         Files.writeString(pkg.resolve("Foo.java"), "package com.example; class Foo {}");
         Files.writeString(pkg.resolve("Bar.kt"), "package com.example\nclass Bar");
 
-        List<Path> files = SourceFileScanner.collectJavaFiles(
+        List<Path> files = SourceFileScanner.collectSourceFiles(
                 tempDir.resolve("src/main/java"));
 
         assertEquals(2, files.size(), "Both .java and .kt must be collected; got " + files);
